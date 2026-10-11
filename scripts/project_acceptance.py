@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 EXPECTED_VIEWS = {"TOP", "BOTTOM", "FRONT", "REAR", "LEFT", "RIGHT"}
+EXPECTED_AUTOMATIC_CODES = {f"A{i:02d}" for i in range(1, 12)}
 VALID_REVIEW = ("pass", "fail", "pending")
 
 
@@ -30,12 +32,56 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def calibrated_transform_ok(entry: Any, tolerance: float) -> bool:
+    if not isinstance(entry, dict) or not entry.get("transform_id"):
+        return False
+    if entry.get("projection_source") != "TechDraw.projectEx calculation marker":
+        return False
+    matrix = entry.get("model_to_view_matrix")
+    offset = entry.get("model_to_view_offset")
+    points = entry.get("calibration_points")
+    if not (
+        isinstance(matrix, list) and len(matrix) == 2
+        and all(isinstance(row, list) and len(row) == 3 for row in matrix)
+        and isinstance(offset, list) and len(offset) == 2
+        and isinstance(points, list) and len(points) >= 3
+    ):
+        return False
+    projected = []
+    for point in points:
+        actual = point.get("projected_2d") if isinstance(point, dict) else None
+        transformed = point.get("transform_2d") if isinstance(point, dict) else None
+        residual = point.get("residual_mm") if isinstance(point, dict) else None
+        if not (
+            isinstance(actual, list) and len(actual) == 2
+            and isinstance(transformed, list) and len(transformed) == 2
+            and isinstance(residual, (int, float)) and math.isfinite(float(residual))
+            and math.hypot(float(actual[0]) - float(transformed[0]),
+                           float(actual[1]) - float(transformed[1])) <= tolerance
+            and float(residual) <= tolerance
+        ):
+            return False
+        projected.append((float(actual[0]), float(actual[1])))
+    noncollinear = any(
+        abs((projected[j][0] - projected[i][0]) * (projected[k][1] - projected[i][1])
+            - (projected[j][1] - projected[i][1]) * (projected[k][0] - projected[i][0])) > 1e-6
+        for i in range(len(projected)) for j in range(i + 1, len(projected))
+        for k in range(j + 1, len(projected))
+    )
+    return (
+        noncollinear and isinstance(entry.get("max_residual_mm"), (int, float))
+        and 0 <= entry["max_residual_mm"] <= tolerance and entry.get("pass") is True
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", required=True, type=Path)
     parser.add_argument("--fit", required=True, type=Path)
     parser.add_argument("--performance", required=True, type=Path)
     parser.add_argument("--text-audit", required=True, type=Path)
+    parser.add_argument("--stud-audit", required=True, type=Path)
+    parser.add_argument("--feature-audit", required=True, type=Path)
     parser.add_argument("--preview", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--view-review", choices=VALID_REVIEW, default="pending")
@@ -50,6 +96,29 @@ def main() -> int:
     fit = load_json(args.fit)
     perf = load_json(args.performance)
     text_audit = load_json(args.text_audit)
+    stud_audit = load_json(args.stud_audit)
+    feature_audit = load_json(args.feature_audit)
+    dxf_path = Path(perf.get("path", ""))
+    dxf_exists = dxf_path.is_file() and dxf_path.stat().st_size > 0
+    current_dxf_sha256 = sha256(dxf_path) if dxf_exists else None
+    recorded_dxf_sha256 = (check.get("readback") or {}).get("sha256")
+
+    def same_dxf_path(value: Any) -> bool:
+        if not value or not dxf_exists:
+            return False
+        try:
+            return Path(str(value)).resolve() == dxf_path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    performance_report_current = (
+        dxf_exists and same_dxf_path(perf.get("path")) and args.performance.is_file()
+        and args.performance.stat().st_mtime_ns >= dxf_path.stat().st_mtime_ns
+    )
+    preview_current = (
+        dxf_exists and args.preview.is_file() and args.preview.stat().st_size > 0
+        and args.preview.stat().st_mtime_ns >= dxf_path.stat().st_mtime_ns
+    )
     items: list[dict[str, Any]] = []
 
     def add(code: str, name: str, gate: str, status: str, evidence: Any, action: str) -> None:
@@ -62,9 +131,15 @@ def main() -> int:
             "action_if_not_pass": action,
         })
 
-    source_ok = bool(check.get("source")) and check.get("source_preserved") is True
+    source_sha256 = check.get("source_sha256")
+    source_ok = (
+        bool(check.get("source")) and check.get("source_preserved") is True
+        and isinstance(source_sha256, str) and len(source_sha256) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in source_sha256)
+    )
     add("A01", "源模型标识与保留", "automatic", "pass" if source_ok else "fail",
-        {"source": check.get("source"), "source_preserved": check.get("source_preserved")},
+        {"source": check.get("source"), "source_sha256": source_sha256,
+         "source_preserved": check.get("source_preserved")},
         "恢复当前 STEP 的可追溯来源并从源模型重新生成。")
 
     front = check.get("front_source")
@@ -95,18 +170,83 @@ def main() -> int:
         and isinstance(item.get("inner"), (int, float)) and item["inner"] > 0
         and isinstance(item.get("height"), (int, float)) and item["height"] > 0
         and item.get("side") in EXPECTED_VIEWS
+        and item.get("classification_status") == "confirmed"
         for item in fasteners
     )
     category_total = sum(int(row.get("total", 0)) for row in check.get("category_rows", []))
     side_total = sum(int(value) for value in (check.get("side_counts") or {}).values())
+    candidate_summary = check.get("fastener_candidate_summary") or {}
+    candidate_values = [
+        candidate_summary.get("candidate_count"),
+        candidate_summary.get("confirmed_count"),
+        candidate_summary.get("rejected_count"),
+        candidate_summary.get("pending_count"),
+    ]
+    candidate_ok = (
+        all(isinstance(value, int) and value >= 0 for value in candidate_values)
+        and candidate_summary.get("candidate_count") == sum(candidate_values[1:])
+        and candidate_summary.get("confirmed_count") == len(fasteners)
+        and candidate_summary.get("pending_count") == 0
+    )
+    annotation = check.get("annotation_validation") or {}
+    position_tolerance = annotation.get("position_tolerance_mm")
+    transforms = annotation.get("per_view_transforms") or {}
+    transforms_ok = (
+        isinstance(position_tolerance, (int, float)) and 0 < position_tolerance <= 1.0
+        and set(transforms) == EXPECTED_VIEWS
+        and all(calibrated_transform_ok(entry, float(position_tolerance)) for entry in transforms.values())
+    )
+    annotation_items = annotation.get("per_item") or []
+    annotation_tags = [item.get("tag") for item in annotation_items]
+    annotation_record_ok = (
+        annotation.get("pass") is True
+        and len(annotation_items) == len(fasteners)
+        and len(annotation_tags) == len(set(annotation_tags))
+        and set(annotation_tags) == set(tags)
+        and all(item.get("pass") is True for item in annotation_items)
+        and not annotation.get("extra_marker_handles")
+        and not annotation.get("duplicate_marker_handles")
+    )
+    stud_audit_ok = (
+        stud_audit.get("pass") is True and stud_audit.get("status") == "pass"
+        and same_dxf_path(stud_audit.get("path"))
+        and stud_audit.get("sha256") == recorded_dxf_sha256 == current_dxf_sha256
+        and stud_audit.get("source_hash_pass") is True
+        and stud_audit.get("step_sha256") == source_sha256
+        and stud_audit.get("recorded_step_sha256") == source_sha256
+        and stud_audit.get("step_geometry_pass") is True
+        and stud_audit.get("independent_step_fastener_count") == len(fasteners)
+        and stud_audit.get("recorded_fastener_count") == len(fasteners)
+        and not stud_audit.get("missing_step_sources")
+        and not stud_audit.get("extra_step_sources")
+        and stud_audit.get("expected_items") == len(fasteners)
+        and stud_audit.get("checked_items") == len(fasteners)
+        and not stud_audit.get("missing_anchor_handles")
+        and not stud_audit.get("extra_anchor_handles")
+        and not stud_audit.get("missing_tag_handles")
+        and not stud_audit.get("extra_tag_handles")
+        and not stud_audit.get("duplicate_anchor_handles")
+        and not stud_audit.get("duplicate_tag_handles")
+        and not stud_audit.get("missing_outline_handles")
+        and not stud_audit.get("extra_outline_handles")
+        and not stud_audit.get("duplicate_outline_handles")
+        and all(item.get("outline_geometry_and_color_pass") is True
+                for item in (stud_audit.get("items") or []))
+    )
     stud_ok = (
         required_fields_ok and len(tags) == len(set(tags))
         and category_total == len(fasteners) == side_total
+        and candidate_ok and transforms_ok and annotation_record_ok and stud_audit_ok
     )
-    add("A04", "压铆分类、位号与数量", "automatic", "pass" if stud_ok else "fail",
+    add("A04", "压铆识别、分类、分面与位号位置", "automatic", "pass" if stud_ok else "fail",
         {"instances": len(fasteners), "unique_tags": len(set(tags)),
-         "category_total": category_total, "side_total": side_total},
-        "重新识别和分类压铆件，修复位号或数量来源后整图重生成。")
+         "category_total": category_total, "side_total": side_total,
+         "candidate_summary": candidate_summary,
+         "position_tolerance_mm": position_tolerance,
+         "per_view_transforms": transforms,
+         "annotation_validation": annotation,
+         "independent_final_dxf_stud_audit": stud_audit},
+        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、柱身侧和坐标变换，修复后重新导出并复查。")
 
     refs = fit.get("projection_reference_points") or {}
     projection = check.get("projection_validation") or {}
@@ -183,7 +323,22 @@ def main() -> int:
         and style_validation.get("extension_lines") is True
         and bool(style_validation.get("dimstyle_names"))
     )
-    dimensions_ok = dimensions.get("pass") is True and native_style_ok and set(dimension_views) == EXPECTED_VIEWS
+    feature_record = check.get("feature_annotation_validation") or {}
+    feature_audit_ok = (
+        feature_audit.get("pass") is True and feature_audit.get("status") == "pass"
+        and same_dxf_path(feature_audit.get("path"))
+        and feature_audit.get("sha256") == recorded_dxf_sha256 == current_dxf_sha256
+        and feature_audit.get("step_sha256") == source_sha256
+        and feature_audit.get("independent_feature_count") == feature_record.get("source_feature_count")
+        and feature_audit.get("independent_group_count") == feature_record.get("group_count")
+        and feature_audit.get("recorded_group_count") == feature_record.get("group_count")
+        and not feature_audit.get("missing_group_ids") and not feature_audit.get("extra_group_ids")
+        and not feature_audit.get("missing_text_handles") and not feature_audit.get("extra_text_handles")
+        and not feature_audit.get("missing_leader_handles") and not feature_audit.get("extra_leader_handles")
+    )
+    dimensions_ok = (dimensions.get("pass") is True and native_style_ok
+                     and set(dimension_views) == EXPECTED_VIEWS and feature_record.get("pass") is True
+                     and feature_audit_ok)
     if dimensions_ok:
         dimensions_ok = all(
             isinstance(entry, dict)
@@ -195,8 +350,10 @@ def main() -> int:
     add("A07", "六视图尺寸覆盖与模型回算", "automatic", "pass" if dimensions_ok else "fail",
         {"views": sorted(dimension_views), "per_view": dimension_views,
          "style_validation": style_validation,
+         "feature_annotation_validation": feature_record,
+         "independent_step_to_dxf_feature_audit": feature_audit,
          "violations": dimensions.get("violations"), "pass": dimensions.get("pass")},
-        "按特征尺寸清单补齐六个视图尺寸，改用原生 DIMENSION 和统一 DIMSTYLE，修正箭头、尺寸界线、符号、定位或数值后从模型重新生成。")
+        "若仅漏标则补齐缺失的原生 DIMENSION/孔标并保留已有正确标注；否则按特征清单修正样式、定位、数值或上游识别后重新导出。")
 
     table = check.get("table_layout") or {}
     edge_attachment = table.get("edge_attachment") or {}
@@ -214,7 +371,8 @@ def main() -> int:
         and checked_text_count_ok
         and text_audit.get("pass") is True
         and text_audit.get("status") == "pass"
-        and text_audit.get("sha256") == (check.get("readback") or {}).get("sha256")
+        and same_dxf_path(text_audit.get("path"))
+        and text_audit.get("sha256") == recorded_dxf_sha256 == current_dxf_sha256
         and text_audit.get("checked_table_text_entities") == checked_text_entities
         and text_audit.get("manifest_entries") == checked_text_entities
         and not text_audit.get("missing_handles")
@@ -236,12 +394,11 @@ def main() -> int:
          "violations": table.get("violations")},
         "把表格重新锚定到图框边，给表名设置独立合并行，并按最终字体字形包围框重算基线、字号、行高、列宽和合并网格，确保文字不压线或跨格。")
 
-    dxf_path = Path(perf.get("path", ""))
     readback = check.get("readback") or {}
     dxf_ok = (
-        dxf_path.is_file() and dxf_path.stat().st_size > 0
+        dxf_exists
         and readback.get("audit_errors") == 0 and readback.get("audit_fixes") == 0
-        and readback.get("sha256") == sha256(dxf_path)
+        and readback.get("sha256") == current_dxf_sha256
     )
     add("A09", "最终 DXF 回读与文件一致性", "automatic", "pass" if dxf_ok else "fail",
         {"path": str(dxf_path), "file_exists": dxf_path.is_file(),
@@ -250,7 +407,8 @@ def main() -> int:
         "关闭源文档，重新导出并回读最终 DXF，禁止直接修补交付文件。")
 
     perf_ok = (
-        not perf.get("hard_failures") and not perf.get("audit_errors") and not perf.get("audit_fixes")
+        performance_report_current
+        and not perf.get("hard_failures") and not perf.get("audit_errors") and not perf.get("audit_fixes")
         and perf.get("duplicate_polylines_same_layer") == 0 and perf.get("nonfinite_points") == 0
         and perf.get("visible_hidden_exact_overlap") == 0
         and (perf.get("linetype_validation") or {}).get("pass") is True
@@ -279,7 +437,7 @@ def main() -> int:
 
     line_review = projection.get("readback_line_review") or {}
     preview_ok = (
-        args.preview.is_file() and args.preview.stat().st_size > 0
+        preview_current
         and line_review.get("source") == "independent_final_dxf_preview_review"
         and line_review.get("preview_sha256") == sha256(args.preview)
         and bool(line_review.get("reviewer"))
@@ -317,7 +475,12 @@ def main() -> int:
     drawing_pending = [item for item in drawing_items if item["status"] == "pending"]
     approval = next(item for item in items if item["gate"] == "approval")
     automatic = [item for item in items if item["gate"] == "automatic"]
-    auto_status = "pass" if all(item["status"] == "pass" for item in automatic) else "fail"
+    automatic_codes = {item["code"] for item in automatic}
+    no_skipped_automatic_checks = (
+        automatic_codes == EXPECTED_AUTOMATIC_CODES
+        and all(item["status"] in {"pass", "fail"} for item in automatic)
+    )
+    auto_status = "pass" if no_skipped_automatic_checks and all(item["status"] == "pass" for item in automatic) else "fail"
     if drawing_failed:
         overall = "rework_required"
     elif drawing_pending:
@@ -333,13 +496,45 @@ def main() -> int:
     else:
         production_release = "pending"
 
+    failed_codes = [item["code"] for item in failed]
+    pending_codes = [item["code"] for item in pending]
+    if drawing_failed:
+        loop_action = "supplement_isolated_missing_annotations_or_repair_affected_source_then_reexport_and_repeat_all_checks"
+    elif drawing_pending:
+        loop_action = "complete_required_input_and_manual_checks_then_rerun_acceptance"
+    else:
+        loop_action = "drawing_checks_complete"
+
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v1",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v5",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,
         "overall_status": overall,
         "production_release": production_release,
+        "closed_loop": {
+            "no_skipped_automatic_checks": no_skipped_automatic_checks,
+            "expected_automatic_codes": sorted(EXPECTED_AUTOMATIC_CODES),
+            "executed_automatic_codes": sorted(automatic_codes),
+            "current_dxf_sha256": current_dxf_sha256,
+            "current_step_sha256": source_sha256,
+            "independent_step_to_dxf_geometry_verified": stud_audit_ok,
+            "all_independent_artifacts_bound_to_current_dxf": (
+                performance_report_current
+                and same_dxf_path(text_audit.get("path"))
+                and text_audit.get("sha256") == current_dxf_sha256
+                and same_dxf_path(stud_audit.get("path"))
+                and stud_audit.get("sha256") == current_dxf_sha256
+                and same_dxf_path(feature_audit.get("path"))
+                and feature_audit.get("sha256") == current_dxf_sha256
+                and feature_audit.get("step_sha256") == source_sha256
+                and preview_current
+            ),
+            "failed_codes": failed_codes,
+            "pending_codes": pending_codes,
+            "next_action": loop_action,
+            "drawing_checks_complete": overall == "drawing_acceptance_passed",
+        },
         "drawing_summary": {
             "pass": sum(i["status"] == "pass" for i in drawing_items),
             "fail": len(drawing_failed),
