@@ -4,6 +4,30 @@
 
 本 Skill 面向带压铆件的钣金安装工程图，不用于推断 STEP 中不存在的材料、公差、螺纹等级、折弯展开或加工工艺参数。
 
+## 工具链
+
+| 工具/组件 | 用途 | 要求与边界 |
+| --- | --- | --- |
+| Codex + 本 Skill | 读取项目输入，选择专项规则，组织出图、回读和验收 | Skill 提供规则、样例和审计工具，不用历史图纸替代当前 STEP 数据 |
+| FreeCAD / `FreeCADCmd` | 导入并重算 STEP，读取装配与实体几何，取得标准视向，执行 TechDraw HLR 正投影 | 几何处理脚本应在能够导入 `FreeCAD`、`Part` 和 `TechDraw` 的 FreeCAD Python 环境运行；当前 HLR 分组规则按 FreeCAD 1.1 验证，版本变化后须重新验证 `projectEx()` 返回结构 |
+| Python 3 | 运行项目出图辅助程序和 Skill 的独立审计脚本 | 普通 DXF 后处理可使用系统 Python；调用 FreeCAD API 的程序使用 FreeCAD 自带 Python 或 `FreeCADCmd`，不能假定系统 Python 已安装 FreeCAD 模块 |
+| `ezdxf` | 创建、编辑和重新读取 DXF；检查图层、线型、线宽、字体、实体、包围框、重合及文件结构 | 出图环境和审计环境应使用彼此兼容的版本；最终验收必须重新读取已关闭的最终 DXF，不能复用生成器内存中的对象或自报结论 |
+| Matplotlib + `ezdxf.addons.drawing` | 从最终 DXF 生成高分辨率回读预览 | 无界面运行使用非交互后端（如 `Agg`）；预览只用于审图证据，不替代可编辑 DXF，也不能代替目标 CAD 测试 |
+| 工程字体 | 显示中文、数字和 `⌀/R/±/°` 等工程符号 | 项目或加工厂字体优先；本项目 Windows 默认使用可解析的 `simfang.ttf`，禁止静默字体替换 |
+| 目标 CAD 阅读器 | 验证最终 DXF 的实际兼容性和交互性能 | 使用加工厂指定或项目常用软件完成打开、缩放、平移、图层切换、打印预览和保存副本测试；未测试时状态保持“待目标阅读器验证” |
+
+项目可以使用自己的 FreeCAD 出图脚本完成模型识别、投影、标注和 DXF 组装；这些生成脚本不固定在 Skill 内。Skill 自带的 `scripts/` 只负责最终 DXF 的文字审计、结构与性能审计、预览检查记录和项目验收汇总，不能替代出图程序。
+
+开始任务前至少确认以下工具可调用；命令名不在 `PATH` 时使用实际可执行文件的绝对路径：
+
+```powershell
+FreeCADCmd --version
+python --version
+python -c "import ezdxf, matplotlib; print(ezdxf.__version__, matplotlib.__version__)"
+```
+
+每次出图记录实际使用的 FreeCAD、Python、`ezdxf`、DXF 导出器和目标 CAD 版本。缺少 FreeCAD 时不能从 STEP 可靠生成投影；缺少 `ezdxf` 时不能运行本 Skill 的独立 DXF 审计；缺少目标 CAD 验证时只能交付为待验收状态。
+
 ## 从 STEP 工程中使用
 
 Skill 目录结构如下，实际存放位置不限：
