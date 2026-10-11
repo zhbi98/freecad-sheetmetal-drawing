@@ -333,8 +333,10 @@ def main() -> int:
         and feature_audit.get("independent_group_count") == feature_record.get("group_count")
         and feature_audit.get("recorded_group_count") == feature_record.get("group_count")
         and not feature_audit.get("missing_group_ids") and not feature_audit.get("extra_group_ids")
-        and not feature_audit.get("missing_text_handles") and not feature_audit.get("extra_text_handles")
-        and not feature_audit.get("missing_leader_handles") and not feature_audit.get("extra_leader_handles")
+        and feature_record.get("annotation_policy") == "no_automatic_grouped_callout"
+        and feature_record.get("displayed_group_callouts") == 0
+        and feature_audit.get("record_policy_ok") is True
+        and not feature_audit.get("forbidden_callout_handles")
     )
     dimensions_ok = (dimensions.get("pass") is True and native_style_ok
                      and set(dimension_views) == EXPECTED_VIEWS and feature_record.get("pass") is True

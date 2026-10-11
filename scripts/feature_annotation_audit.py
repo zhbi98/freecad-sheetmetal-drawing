@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently compare STEP circular-hole groups with final-DXF callouts."""
+"""Compare STEP circular-hole inventory and reject automatic grouped callouts."""
 
 from __future__ import annotations
 
@@ -105,14 +105,9 @@ def independent_groups(step: Path, App, Part):
             "group_id": f"{axis}_D{fmt(diameter)}",
             "axis": axis, "diameter": diameter, "count": count,
             "target_view": AXIS_VIEW[axis],
-            "label": f"{count}×⌀{fmt(diameter)} THRU",
         } for (axis, diameter), count in sorted(grouped.items())], len(holes)
     finally:
         App.closeDocument(document.Name)
-
-
-def text_value(entity):
-    return entity.text if entity.dxftype() == "MTEXT" else str(entity.dxf.text)
 
 
 def main() -> int:
@@ -129,49 +124,38 @@ def main() -> int:
     document = ezdxf.readfile(args.dxf)
     audit = document.audit()
     modelspace = document.modelspace()
-    actual_text_handles = {str(entity.dxf.handle) for entity in modelspace
-                           if entity.dxf.layer == "FEATURE_CALLOUT"
-                           and entity.dxftype() in {"TEXT", "MTEXT"}}
-    actual_leader_handles = {str(entity.dxf.handle) for entity in modelspace
-                             if entity.dxf.layer == "FEATURE_CALLOUT"
-                             and entity.dxftype() in {"LEADER", "MULTILEADER"}}
-    expected_text_handles, expected_leader_handles, results = [], [], []
+    forbidden_callout_handles = sorted(
+        str(entity.dxf.handle) for entity in modelspace
+        if entity.dxf.layer == "FEATURE_CALLOUT"
+    )
+    results = []
     for group_id, expected_group in expected_by_id.items():
         record = recorded_by_id.get(group_id, {})
-        text_handle = str(record.get("text_handle") or "")
-        leader_handle = str(record.get("leader_handle") or "")
-        text_entity = document.entitydb.get(text_handle) if text_handle else None
-        leader_entity = document.entitydb.get(leader_handle) if leader_handle else None
-        text_ok = (text_entity is not None and text_entity.dxf.layer == "FEATURE_CALLOUT"
-                   and text_entity.dxftype() in {"TEXT", "MTEXT"}
-                   and text_value(text_entity) == expected_group["label"])
-        leader_ok = (leader_entity is not None and leader_entity.dxf.layer == "FEATURE_CALLOUT"
-                     and leader_entity.dxftype() in {"LEADER", "MULTILEADER"})
         record_ok = all(record.get(key) == expected_group[key]
-                        for key in ("axis", "diameter", "count", "target_view", "label"))
-        if text_handle:
-            expected_text_handles.append(text_handle)
-        if leader_handle:
-            expected_leader_handles.append(leader_handle)
+                        for key in ("axis", "diameter", "count", "target_view"))
+        policy_ok = (record.get("annotation_policy") == "no_automatic_grouped_callout"
+                     and record.get("displayed") is False
+                     and not record.get("text_handle") and not record.get("leader_handle"))
         results.append({"group_id": group_id, "expected": expected_group,
-                        "record": record, "text_ok": text_ok,
-                        "leader_ok": leader_ok, "record_ok": record_ok,
-                        "pass": text_ok and leader_ok and record_ok})
+                        "record": record, "record_ok": record_ok,
+                        "policy_ok": policy_ok,
+                        "pass": record_ok and policy_ok})
     missing_group_ids = sorted(set(expected_by_id) - set(recorded_by_id))
     extra_group_ids = sorted(set(recorded_by_id) - set(expected_by_id))
-    missing_text_handles = sorted(set(expected_text_handles) - actual_text_handles)
-    extra_text_handles = sorted(actual_text_handles - set(expected_text_handles))
-    missing_leader_handles = sorted(set(expected_leader_handles) - actual_leader_handles)
-    extra_leader_handles = sorted(actual_leader_handles - set(expected_leader_handles))
     step_hash, dxf_hash = sha256(args.step), sha256(args.dxf)
+    record_policy_ok = (
+        (check.get("feature_annotation_validation") or {}).get("annotation_policy")
+        == "no_automatic_grouped_callout"
+        and (check.get("feature_annotation_validation") or {}).get(
+            "displayed_group_callouts") == 0
+    )
     passed = (
         not audit.errors and not audit.fixes
         and check.get("source_sha256") == step_hash
         and (check.get("readback") or {}).get("sha256") == dxf_hash
         and len(recorded_by_id) == len(recorded)
         and not missing_group_ids and not extra_group_ids
-        and not missing_text_handles and not extra_text_handles
-        and not missing_leader_handles and not extra_leader_handles
+        and record_policy_ok and not forbidden_callout_handles
         and feature_count > 0 and all(result["pass"] for result in results)
     )
     result = {
@@ -182,8 +166,9 @@ def main() -> int:
         "independent_feature_count": feature_count,
         "independent_group_count": len(expected), "recorded_group_count": len(recorded),
         "missing_group_ids": missing_group_ids, "extra_group_ids": extra_group_ids,
-        "missing_text_handles": missing_text_handles, "extra_text_handles": extra_text_handles,
-        "missing_leader_handles": missing_leader_handles, "extra_leader_handles": extra_leader_handles,
+        "annotation_policy": "no_automatic_grouped_callout",
+        "record_policy_ok": record_policy_ok,
+        "forbidden_callout_handles": forbidden_callout_handles,
         "audit_errors": len(audit.errors), "audit_fixes": len(audit.fixes),
         "groups": results,
     }

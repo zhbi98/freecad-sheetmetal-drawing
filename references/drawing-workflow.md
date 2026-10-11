@@ -38,8 +38,8 @@
 ## 5. 导出、回读和验收
 
 1. 按[DXF 交付规则](dxf-delivery.md)导出单一可编辑 DXF。文件名默认 `<前缀>_六视图压铆标注.dxf`；不得拆页、改扩展名、栅格化或依赖未交付外部参照。
-2. 关闭生成文档后重新打开最终 DXF。先运行 `scripts/dxf_text_audit.py`；再用 FreeCAD Python 运行 `scripts/feature_annotation_audit.py --step <当前源 STEP/STP>`，独立重建圆孔组并检查孔标文字、引线、数量和缺失项；随后运行 `scripts/stud_annotation_audit.py --step <当前源 STEP/STP>`，由新进程重新导入三维模型、独立复算压铆实例集合、安装孔、规格、柱身侧、三维锚点和投影纸面位置，并与最终 DXF 的锚点、位号及类别色内外轮廓逐件比较；最后运行 `scripts/dxf_performance_audit.py`、生成回读预览，并核对版本、单位、图层、线型、实体、六视图、尺寸、图幅和打印设置。任何审计不得复用生成器预填的通过结论；STEP 和 DXF 哈希必须同时匹配本轮记录，预览进程必须正常退出。
-3. 按[项目出图验收闭环](project-acceptance.md)使用 FreeCAD Python 运行 `scripts/closed_loop_recheck.py`，对同一 STEP 和最终 DXF 连续执行 `2～3` 遍完整自动闭环，默认 `3` 遍。脚本每遍重新调用文字、STEP→DXF 孔标、STEP→DXF 压铆、性能和 `project_acceptance.py`，并保存独立报告；不得用复制文件或同一内存结果替代重新读取。
+2. 关闭生成文档后重新打开最终 DXF。先运行 `scripts/dxf_text_audit.py`；再用 FreeCAD Python 运行 `scripts/feature_annotation_audit.py --step <当前源 STEP/STP>`，独立重建圆孔清单并确认没有自动生成 `n×⌀D THRU` 成组孔标；随后运行 `scripts/stud_annotation_audit.py --step <当前源 STEP/STP>`，由新进程重新导入三维模型、独立复算压铆实例集合、安装孔、规格、柱身侧、三维锚点和投影纸面位置，并与最终 DXF 的锚点、位号及类别色内外轮廓逐件比较；最后运行 `scripts/dxf_performance_audit.py`、生成回读预览，并核对版本、单位、图层、线型、实体、六视图、尺寸、图幅和打印设置。任何审计不得复用生成器预填的通过结论；STEP 和 DXF 哈希必须同时匹配本轮记录，预览进程必须正常退出。
+3. 按[项目出图验收闭环](project-acceptance.md)使用 FreeCAD Python 运行 `scripts/closed_loop_recheck.py`，对同一 STEP 和最终 DXF 连续执行 `2～3` 遍完整自动闭环，默认 `3` 遍。脚本每遍重新调用文字、STEP 圆孔清单/禁用成组孔标、STEP→DXF 压铆、性能和 `project_acceptance.py`，并保存独立报告；不得用复制文件或同一内存结果替代重新读取。
 4. 读取连续复核汇总及每遍验收记录。任一遍 `failed_codes` 非空、命令异常、哈希变化或报告缺失，就作废该轮及此前连续通过计数。若证据证明只是可唯一确定的漏标，保留已有正确标注，只在标注生成源中补齐缺失项、同步检查记录并重新导出；误标、多标、错误视图/坐标/识别或补标造成碰撞时按影响范围返工。修改后都必须重新从第 1 遍执行，不允许跳过失败项或复用旧报告。只要任一遍 `pending_codes` 非空，就继续完成所需输入或实际人工检查并重跑验收，不得把待验收写成正确。只有连续复核 `pass=true` 且最终验收 `drawing_checks_complete=true` 才结束制图闭环。
 
 **阶段通过：** 连续 `2～3` 遍（默认 `3` 遍）A01～A11 全部出现且通过，所有独立证据绑定同一当前 STEP 和 DXF，失败项均已修复并从第 1 遍重新复查，全部适用人工和项目输入门禁也已关闭，且重复检查汇总 `pass=true`、最终 `drawing_checks_complete=true`。工程批准和投产放行仍由企业流程决定。
