@@ -122,6 +122,9 @@ def rebuild_step_evidence(step_path: Path, App, Part):
         candidates = [obj for obj in objects if obj not in sheets]
         if not sheets:
             raise RuntimeError("No sheet body could be independently identified in STEP")
+        sheet_vertices = [vertex.Point for sheet in sheets for vertex in sheet.Shape.Vertexes]
+        if not sheet_vertices:
+            raise RuntimeError("No sheet vertices available for exterior-side validation")
         sheet_cylinders = []
         for sheet in sheets:
             for face_index, face in enumerate(sheet.Shape.Faces, 1):
@@ -188,6 +191,29 @@ def rebuild_step_evidence(step_path: Path, App, Part):
                 continue
             body_direction = -axis if low_protrusion > high_protrusion else axis
             anchor = point_on_axis_at(origin, axis, midplane)
+            # A target annotation view is the installation panel's exterior
+            # view, not necessarily the side on which the stud body extends.
+            # The assembly envelope is accepted only as positive evidence when
+            # exactly one local sheet face lies on the corresponding outer
+            # extreme.  Recesses, internal partitions and open structures stay
+            # pending instead of being guessed from an axis sign or body side.
+            assembly_coordinates = [point.dot(axis) for point in sheet_vertices]
+            assembly_min, assembly_max = min(assembly_coordinates), max(assembly_coordinates)
+            sheet_thickness = sheet_max - sheet_min
+            exterior_tolerance = max(0.15, min(0.50, sheet_thickness * 0.25))
+            low_is_envelope = abs(sheet_min - assembly_min) <= exterior_tolerance
+            high_is_envelope = abs(assembly_max - sheet_max) <= exterior_tolerance
+            exterior_direction = None
+            if low_is_envelope != high_is_envelope:
+                exterior_direction = -axis if low_is_envelope else axis
+            installation_outer_side = (side_from_vector(exterior_direction)
+                                       if exterior_direction is not None else None)
+            body_side = side_from_vector(body_direction)
+            extension_relation = ("outward" if exterior_direction is not None
+                                  and body_direction.dot(exterior_direction) > 0.5
+                                  else "inward" if exterior_direction is not None
+                                  and body_direction.dot(exterior_direction) < -0.5
+                                  else "pending")
             confirmed.append({
                 "source": obj.Name, "product_name": obj.Label,
                 "axis_origin": [origin.x, origin.y, origin.z],
@@ -196,8 +222,23 @@ def rebuild_step_evidence(step_path: Path, App, Part):
                 "outer": round(2.0 * max(float(s.Radius) for s in coaxial), 2),
                 "inner": round(2.0 * min(float(s.Radius) for s in coaxial), 2),
                 "height": round(body_max - body_min, 3),
-                "side": side_from_vector(body_direction),
+                "side": installation_outer_side,
+                "installation_outer_side": installation_outer_side,
+                "installation_outer_vector": ([exterior_direction.x, exterior_direction.y,
+                                                 exterior_direction.z]
+                                                if exterior_direction is not None else None),
+                "exterior_side_status": "confirmed" if exterior_direction is not None else "pending",
+                "exterior_side_basis": "local_sheet_face_on_unique_assembly_envelope_extreme",
+                "exterior_side_evidence": {
+                    "assembly_axial_range": [assembly_min, assembly_max],
+                    "local_sheet_axial_range": [sheet_min, sheet_max],
+                    "low_face_on_envelope": low_is_envelope,
+                    "high_face_on_envelope": high_is_envelope,
+                    "tolerance_mm": exterior_tolerance,
+                },
+                "body_side": body_side,
                 "body_side_vector": [body_direction.x, body_direction.y, body_direction.z],
+                "body_extension_relation": extension_relation,
                 "body_axial_range": [body_min, body_max],
                 "low_side_protrusion_mm": low_protrusion,
                 "high_side_protrusion_mm": high_protrusion,
@@ -318,6 +359,10 @@ def main() -> int:
     check = json.loads(args.check.read_text(encoding="utf-8"))
     validation = check.get("annotation_validation") or {}
     records = validation.get("per_item") or []
+    confirmed_inputs = check.get("confirmed_inputs") or {}
+    exterior_overrides = confirmed_inputs.get("installation_outer_sides") or {}
+    if not isinstance(exterior_overrides, dict):
+        exterior_overrides = {}
     bounds = validation.get("view_bounds_sheet_mm") or {}
     anchor_layer = str(validation.get("anchor_layer") or "STUD_ANCHOR")
     tolerance = validation.get("position_tolerance_mm")
@@ -335,6 +380,9 @@ def main() -> int:
         independent_sources, recorded_sources = set(independent_by_source), {s for s in record_by_source if s}
         missing_step_sources = sorted(recorded_sources - independent_sources)
         extra_step_sources = sorted(independent_sources - recorded_sources)
+        invalid_exterior_overrides = sorted(
+            source for source, view in exterior_overrides.items()
+            if source not in independent_sources or view not in EXPECTED_VIEWS)
         independent_local_bounds = {view: project_bbox(TechDraw, App, step_evidence["compound"], view)
                                     for view in EXPECTED_VIEWS}
         doc = ezdxf.readfile(args.dxf)
@@ -374,7 +422,21 @@ def main() -> int:
         for record in records:
             source, tag = str(record.get("source") or ""), str(record.get("tag") or "")
             independent = independent_by_source.get(source)
-            independent_view = independent.get("side") if independent else None
+            override_view = exterior_overrides.get(source)
+            independent_view = independent.get("installation_outer_side") if independent else None
+            independent_exterior_basis = (independent.get("exterior_side_basis")
+                                          if independent_view is not None else None)
+            independent_extension_relation = (independent.get("body_extension_relation")
+                                              if independent else None)
+            if independent is not None and independent_view is None and override_view in EXPECTED_VIEWS:
+                independent_view = override_view
+                independent_exterior_basis = "user_confirmed"
+                body_vector = independent.get("body_side_vector") or []
+                view_vector = VIEW_DIRECTIONS[override_view]
+                if len(body_vector) == 3:
+                    dot = sum(float(body_vector[i]) * view_vector[i] for i in range(3))
+                    independent_extension_relation = ("outward" if dot > 0.5 else
+                                                      "inward" if dot < -0.5 else "pending")
             anchor_handle, tag_handle = str(record.get("anchor_entity_handle") or ""), str(record.get("tag_text_handle") or "")
             outline_handles = [str(handle) for handle in (record.get("outline_entity_handles") or [])]
             anchor_entity = doc.entitydb.get(anchor_handle) if anchor_handle else None
@@ -406,8 +468,19 @@ def main() -> int:
                 rr, ir = record.get("installation_hole_axial_range"), independent.get("installation_hole_axial_range")
                 if isinstance(rr, (list, tuple)) and len(rr) == 2 and isinstance(ir, (list, tuple)) and len(ir) == 2:
                     hole_range_error = max(abs(float(rr[i]) - float(ir[i])) for i in range(2))
+            exterior_independently_confirmed = (
+                independent is not None
+                and (independent.get("exterior_side_status") == "confirmed"
+                     or independent_exterior_basis == "user_confirmed"))
+            exterior_fields_pass = (exterior_independently_confirmed
+                and recorded_fastener.get("exterior_side_confirmed") is True
+                and recorded_fastener.get("installation_outer_side") == independent_view
+                and recorded_fastener.get("exterior_side_basis") == independent_exterior_basis
+                and recorded_fastener.get("body_side") == independent.get("body_side")
+                and recorded_fastener.get("body_extension_relation") == independent_extension_relation)
             source_geometry_pass = (
-                independent is not None and dimension_pass and record.get("target_view") == independent_view
+                independent is not None and dimension_pass and exterior_fields_pass
+                and record.get("target_view") == independent_view
                 and anchor_3d_error is not None and anchor_3d_error <= GEOMETRY_TOLERANCE_MM
                 and hole_range_error is not None and hole_range_error <= GEOMETRY_TOLERANCE_MM
                 and close_number(record.get("installation_hole_axial_overlap_mm"), independent.get("installation_hole_axial_overlap_mm"), GEOMETRY_TOLERANCE_MM)
@@ -447,6 +520,14 @@ def main() -> int:
             results.append({"source": source, "tag": tag,
                             "recorded_target_view": record.get("target_view"),
                             "independent_step_target_view": independent_view,
+                            "independent_installation_outer_side": (independent.get("installation_outer_side") if independent else None),
+                            "independent_body_side": (independent.get("body_side") if independent else None),
+                            "independent_body_extension_relation": independent_extension_relation,
+                            "independent_exterior_side_status": ("confirmed_by_user" if independent_exterior_basis == "user_confirmed"
+                                                                 else independent.get("exterior_side_status") if independent else None),
+                            "independent_exterior_side_basis": independent_exterior_basis,
+                            "independent_exterior_side_evidence": (independent.get("exterior_side_evidence") if independent else None),
+                            "exterior_fields_pass": exterior_fields_pass,
                             "independent_step_dimensions_mm": ({key: independent[key] for key in ("inner", "outer", "height")} if independent else None),
                             "dimension_pass": dimension_pass, "anchor_3d_error_mm": anchor_3d_error,
                             "installation_hole_range_error_mm": hole_range_error,
@@ -471,7 +552,12 @@ def main() -> int:
         duplicate_outline_handles = sorted({h for h in expected_outline_handles if expected_outline_handles.count(h) > 1})
         missing_outline_handles = sorted(set(expected_outline_handles) - all_outline_handles)
         extra_outline_handles = sorted(all_outline_handles - set(expected_outline_handles))
+        pending_exterior_sources = sorted(
+            item["source"] for item in independent_items
+            if item.get("exterior_side_status") != "confirmed"
+            and exterior_overrides.get(item["source"]) not in EXPECTED_VIEWS)
         step_geometry_pass = (source_hash_pass and not missing_step_sources and not extra_step_sources
+                              and not pending_exterior_sources and not invalid_exterior_overrides
                               and len(record_by_source) == len(records)
                               and all(mapping["pass"] for mapping in view_mapping.values())
                               and (not records or all(result["source_geometry_pass"] for result in results)))
@@ -484,7 +570,7 @@ def main() -> int:
                        and not duplicate_outline_handles and not missing_outline_handles and not extra_outline_handles
                        and (no_fasteners_ok or (bool(records) and all(result["pass"] for result in results))))
         result = {
-            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v2",
+            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v3",
             "path": str(args.dxf.resolve()), "sha256": dxf_hash, "recorded_sha256": recorded_dxf_hash,
             "step_path": str(args.step.resolve()), "step_sha256": step_hash,
             "recorded_step_sha256": recorded_step_hash, "source_hash_pass": source_hash_pass,
@@ -494,6 +580,9 @@ def main() -> int:
             "independent_sheet_objects": step_evidence["sheets"],
             "independent_candidate_count": step_evidence["candidate_count"],
             "independent_step_fastener_count": len(independent_items),
+            "independent_pending_exterior_sources": pending_exterior_sources,
+            "user_confirmed_exterior_overrides": exterior_overrides,
+            "invalid_exterior_overrides": invalid_exterior_overrides,
             "independent_rejected_candidates": step_evidence["rejected"],
             "recorded_fastener_count": len(records),
             "missing_step_sources": missing_step_sources, "extra_step_sources": extra_step_sources,

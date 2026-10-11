@@ -246,7 +246,7 @@ def main() -> int:
          "per_view_transforms": transforms,
          "annotation_validation": annotation,
          "independent_final_dxf_stud_audit": stud_audit},
-        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、柱身侧和坐标变换，修复后重新导出并复查。")
+        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
 
     refs = fit.get("projection_reference_points") or {}
     projection = check.get("projection_validation") or {}
