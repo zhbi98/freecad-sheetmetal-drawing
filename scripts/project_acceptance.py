@@ -174,8 +174,17 @@ def main() -> int:
         and (item.get("hole_type") == "through"
              or (isinstance(item.get("blind_hole_depth"), (int, float))
                  and item["blind_hole_depth"] > 0))
+        and item.get("mark_status") == "confirmed"
+        and item.get("manufacturing_hole_kind") in {"threaded", "unthreaded"}
+        and isinstance(item.get("auxiliary_mark_text"), str)
+        and bool(item["auxiliary_mark_text"].strip())
+        and ((item.get("manufacturing_hole_kind") == "threaded"
+              and isinstance(item.get("thread_designation"), str)
+              and bool(item["thread_designation"]))
+             or (item.get("manufacturing_hole_kind") == "unthreaded"
+                 and item.get("thread_designation") is None))
         and isinstance(item.get("classification_key"), list)
-        and len(item["classification_key"]) == 5
+        and len(item["classification_key"]) == 7
         and item.get("side") in EXPECTED_VIEWS
         and item.get("classification_status") == "confirmed"
         for item in fasteners
@@ -213,11 +222,31 @@ def main() -> int:
         and all(item.get("pass") is True
                 and item.get("hole_type") in {"through", "blind"}
                 and item.get("bore_continuity_confirmed") is True
+                and item.get("mark_status") == "confirmed"
+                and item.get("manufacturing_hole_kind") in {"threaded", "unthreaded"}
+                and isinstance(item.get("auxiliary_mark_text"), str)
+                and bool(item["auxiliary_mark_text"].strip())
+                and ((item.get("manufacturing_hole_kind") == "threaded"
+                      and isinstance(item.get("thread_designation"), str)
+                      and bool(item["thread_designation"]))
+                     or (item.get("manufacturing_hole_kind") == "unthreaded"
+                         and item.get("thread_designation") is None))
                 and isinstance(item.get("classification_key"), list)
-                and len(item["classification_key"]) == 5
+                and len(item["classification_key"]) == 7
                 for item in annotation_items)
         and not annotation.get("extra_marker_handles")
         and not annotation.get("duplicate_marker_handles")
+    )
+    mark_coverage = stud_audit.get("auxiliary_mark_coverage") or {}
+    present_mark_kinds = set(mark_coverage.get("present_manufacturing_hole_kinds") or [])
+    mark_coverage_ok = (
+        mark_coverage.get("pass") is True
+        and mark_coverage.get("requires_both_manufacturing_hole_kinds") is False
+        and mark_coverage.get("expected_instance_count") == len(fasteners)
+        and mark_coverage.get("confirmed_mark_count") == len(fasteners)
+        and not mark_coverage.get("invalid_or_missing_sources")
+        and present_mark_kinds.issubset({"threaded", "unthreaded"})
+        and (not fasteners or bool(present_mark_kinds))
     )
     stud_audit_ok = (
         stud_audit.get("pass") is True and stud_audit.get("status") == "pass"
@@ -228,8 +257,11 @@ def main() -> int:
         and stud_audit.get("recorded_step_sha256") == source_sha256
         and stud_audit.get("step_geometry_pass") is True
         and stud_audit.get("classification_pass") is True
+        and mark_coverage_ok
         and not stud_audit.get("classification_errors")
         and not stud_audit.get("independent_pending_bore_sources")
+        and not stud_audit.get("independent_pending_auxiliary_mark_sources")
+        and not stud_audit.get("invalid_auxiliary_mark_inputs")
         and stud_audit.get("independent_step_fastener_count") == len(fasteners)
         and stud_audit.get("recorded_fastener_count") == len(fasteners)
         and not stud_audit.get("missing_step_sources")
@@ -258,10 +290,11 @@ def main() -> int:
          "category_total": category_total, "side_total": side_total,
          "candidate_summary": candidate_summary,
          "position_tolerance_mm": position_tolerance,
+         "auxiliary_mark_coverage": mark_coverage,
          "per_view_transforms": transforms,
          "annotation_validation": annotation,
          "independent_final_dxf_stud_audit": stud_audit},
-        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、压铆件自身通孔/盲孔拓扑及盲孔深度、完整分类键、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
+        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、3D 辅助字符串及其中的螺纹规格、安装孔、柱轴、压铆件自身通孔/盲孔拓扑及盲孔深度、完整分类键、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
 
     refs = fit.get("projection_reference_points") or {}
     projection = check.get("projection_validation") or {}
@@ -523,7 +556,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v6",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v9",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,

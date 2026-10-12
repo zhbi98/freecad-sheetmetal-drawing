@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -404,34 +405,153 @@ def format_number(value: float) -> str:
     return f"{float(value):.3f}".rstrip("0").rstrip(".")
 
 
+def normalize_auxiliary_mark(value: Any) -> dict[str, Any] | None:
+    """Classify a non-empty auxiliary string by contained metric thread specs."""
+    if isinstance(value, dict):
+        value = value.get("text") or value.get("designation")
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    text = raw.upper().replace("×", "X")
+    pattern = re.compile(
+        r"(?<![A-Z0-9])M\d+(?:\.\d+)?(?:\s*X\s*\d+(?:\.\d+)?)?(?:-\d+[A-Z])?(?![A-Z0-9])"
+    )
+    designations = {
+        re.sub(r"\s+", "", match.group(0)).replace("X", "x")
+        for match in pattern.finditer(text)
+    }
+    if len(designations) > 1:
+        return {"auxiliary_mark_text": raw, "thread_designation": None,
+                "manufacturing_hole_kind": None, "mark_status": "pending",
+                "mark_error": "multiple_thread_designations"}
+    designation = next(iter(designations), None)
+    return {
+        "auxiliary_mark_text": raw,
+        "thread_designation": designation,
+        "manufacturing_hole_kind": "threaded" if designation else "unthreaded",
+        "mark_status": "confirmed",
+    }
+
+
+def apply_auxiliary_mark(item: dict[str, Any], confirmed_value: Any) -> None:
+    # Part.insert() commonly replaces an unavailable STEP occurrence label
+    # with the generated internal object name.  It is an importer placeholder,
+    # not a semantic auxiliary string, so let the STEP-bound review input carry
+    # the original occurrence text in that case.
+    product_name = item.get("product_name")
+    label_mark = (None if product_name == item.get("source")
+                  else normalize_auxiliary_mark(product_name))
+    confirmed_mark = normalize_auxiliary_mark(confirmed_value)
+    if ((label_mark and label_mark.get("mark_status") != "confirmed")
+            or (confirmed_mark and confirmed_mark.get("mark_status") != "confirmed")):
+        item.update({"mark_status": "pending", "auxiliary_mark_source": "ambiguous_thread_designation",
+                     "auxiliary_mark_text": None, "thread_designation": None,
+                     "manufacturing_hole_kind": None})
+        return
+    if label_mark and confirmed_mark and (
+            label_mark["manufacturing_hole_kind"] != confirmed_mark["manufacturing_hole_kind"]
+            or (label_mark["manufacturing_hole_kind"] == "threaded"
+                and label_mark["thread_designation"] != confirmed_mark["thread_designation"])):
+        item.update({"mark_status": "pending", "auxiliary_mark_source": "conflict",
+                     "auxiliary_mark_text": None, "thread_designation": None,
+                     "manufacturing_hole_kind": None})
+        return
+    mark = label_mark or confirmed_mark
+    if mark is None:
+        item.update({"mark_status": "pending", "auxiliary_mark_source": None,
+                     "auxiliary_mark_text": None, "thread_designation": None,
+                     "manufacturing_hole_kind": None})
+        return
+    source = "step_product_or_instance_label" if label_mark else "confirmed_3d_auxiliary_text_review"
+    item.update(mark)
+    item.update({"mark_status": "confirmed", "auxiliary_mark_source": source})
+
+
+def summarize_auxiliary_mark_coverage(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate per-stud auxiliary strings without requiring both thread kinds."""
+    valid_kinds = {"threaded", "unthreaded"}
+    confirmed_count = 0
+    present_kinds: set[str] = set()
+    invalid_sources: list[str] = []
+    for index, item in enumerate(items):
+        kind = item.get("manufacturing_hole_kind")
+        designation = item.get("thread_designation")
+        normalized = normalize_auxiliary_mark(item.get("auxiliary_mark_text"))
+        valid = (
+            item.get("mark_status") == "confirmed"
+            and kind in valid_kinds
+            and normalized is not None
+            and normalized.get("mark_status") == "confirmed"
+            and normalized["manufacturing_hole_kind"] == kind
+            and normalized["thread_designation"] == designation
+            and ((kind == "threaded" and isinstance(designation, str) and bool(designation))
+                 or (kind == "unthreaded" and designation is None))
+        )
+        if valid:
+            confirmed_count += 1
+            present_kinds.add(str(kind))
+        else:
+            invalid_sources.append(str(item.get("source") or f"item[{index}]"))
+    return {
+        "expected_instance_count": len(items),
+        "confirmed_mark_count": confirmed_count,
+        "invalid_or_missing_sources": sorted(invalid_sources),
+        "present_manufacturing_hole_kinds": sorted(present_kinds),
+        "requires_both_manufacturing_hole_kinds": False,
+        "pass": confirmed_count == len(items) and not invalid_sources,
+    }
+
+
 def classification_key(item: dict[str, Any]) -> tuple | None:
     hole_type = item.get("hole_type")
-    if hole_type not in {"through", "blind"}:
+    mark_kind = item.get("manufacturing_hole_kind")
+    designation = item.get("thread_designation")
+    if (hole_type not in {"through", "blind"}
+            or mark_kind not in {"threaded", "unthreaded"}
+            or item.get("mark_status") != "confirmed"
+            or (mark_kind == "threaded"
+                and (not isinstance(designation, str) or not designation))
+            or (mark_kind == "unthreaded" and designation is not None)):
         return None
     depth = round(float(item["blind_hole_depth"]), 3) if hole_type == "blind" else None
     return (round(float(item["inner"]), 3), round(float(item["outer"]), 3),
-            round(float(item["height"]), 3), hole_type, depth)
+            round(float(item["height"]), 3), hole_type, depth, mark_kind, designation)
 
 
 def recorded_classification_key(value: Any) -> tuple | None:
-    if not isinstance(value, (list, tuple)) or len(value) != 5:
+    if not isinstance(value, (list, tuple)) or len(value) != 7:
         return None
     try:
         hole_type = str(value[3])
-        if hole_type not in {"through", "blind"}:
+        mark_kind, designation = str(value[5]), value[6]
+        if (hole_type not in {"through", "blind"}
+                or mark_kind not in {"threaded", "unthreaded"}
+                or (mark_kind == "threaded"
+                    and (not isinstance(designation, str) or not designation))
+                or (mark_kind == "unthreaded" and designation is not None)):
             return None
         depth = round(float(value[4]), 3) if hole_type == "blind" else None
         return (round(float(value[0]), 3), round(float(value[1]), 3),
-                round(float(value[2]), 3), hole_type, depth)
+                round(float(value[2]), 3), hole_type, depth, mark_kind, designation)
     except (TypeError, ValueError):
         return None
 
 
 def classification_spec(key: tuple) -> str:
-    inner, outer, height, hole_type, depth = key
-    base = f"M{format_number(inner)}*D{format_number(outer)}-H{format_number(height)}"
-    return (base + "-THRU" if hole_type == "through"
-            else base + f"-BLIND-DP{format_number(depth)}")
+    inner, outer, height, hole_type, depth, mark_kind, designation = key
+    # Bore topology and threading requirement are independent axes. Never
+    # infer through/blind from threaded/unthreaded, or vice versa.
+    # Project convention: lowercase d denotes bore diameter and uppercase D
+    # denotes outside diameter. Keep the string ASCII-only for DXF portability.
+    prefix = designation if mark_kind == "threaded" else f"d{format_number(inner)}"
+    base = f"{prefix}*D{format_number(outer)}-H{format_number(height)}"
+    if hole_type == "through":
+        return base + "-THRU"
+    if hole_type == "blind" and depth is not None and float(depth) > 0:
+        return base + f"-DP{format_number(depth)}"
+    raise ValueError(f"invalid stud hole type/depth: {hole_type!r}, {depth!r}")
 
 
 def main() -> int:
@@ -446,6 +566,9 @@ def main() -> int:
     exterior_overrides = confirmed_inputs.get("installation_outer_sides") or {}
     if not isinstance(exterior_overrides, dict):
         exterior_overrides = {}
+    auxiliary_mark_inputs = confirmed_inputs.get("stud_auxiliary_marks") or {}
+    if not isinstance(auxiliary_mark_inputs, dict):
+        auxiliary_mark_inputs = {}
     bounds = validation.get("view_bounds_sheet_mm") or {}
     anchor_layer = str(validation.get("anchor_layer") or "STUD_ANCHOR")
     tolerance = validation.get("position_tolerance_mm")
@@ -458,6 +581,8 @@ def main() -> int:
     step_evidence = rebuild_step_evidence(args.step, App, Part)
     try:
         independent_items = step_evidence["confirmed"]
+        for item in independent_items:
+            apply_auxiliary_mark(item, auxiliary_mark_inputs.get(item["source"]))
         independent_by_source = {item["source"]: item for item in independent_items}
         record_by_source = {str(item.get("source") or ""): item for item in records}
         independent_sources, recorded_sources = set(independent_by_source), {s for s in record_by_source if s}
@@ -466,6 +591,11 @@ def main() -> int:
         invalid_exterior_overrides = sorted(
             source for source, view in exterior_overrides.items()
             if source not in independent_sources or view not in EXPECTED_VIEWS)
+        invalid_auxiliary_mark_inputs = sorted(
+            source for source, value in auxiliary_mark_inputs.items()
+            if (source not in independent_sources
+                or normalize_auxiliary_mark(value) is None
+                or normalize_auxiliary_mark(value).get("mark_status") != "confirmed"))
         independent_local_bounds = {view: project_bbox(TechDraw, App, step_evidence["compound"], view)
                                     for view in EXPECTED_VIEWS}
         doc = ezdxf.readfile(args.dxf)
@@ -545,6 +675,23 @@ def main() -> int:
             recorded_fastener = fasteners_by_source.get(source, {})
             dimension_pass = independent is not None and all(close_number(recorded_fastener.get(key), independent.get(key), DIMENSION_TOLERANCE_MM)
                                                              for key in ("outer", "inner", "height"))
+            auxiliary_mark_pass = (
+                independent is not None
+                and independent.get("mark_status") == "confirmed"
+                and recorded_fastener.get("mark_status") == "confirmed"
+                and record.get("mark_status") == "confirmed"
+                and recorded_fastener.get("auxiliary_mark_text")
+                    == independent.get("auxiliary_mark_text")
+                and record.get("auxiliary_mark_text")
+                    == independent.get("auxiliary_mark_text")
+                and recorded_fastener.get("thread_designation")
+                    == independent.get("thread_designation")
+                and record.get("thread_designation")
+                    == independent.get("thread_designation")
+                and recorded_fastener.get("manufacturing_hole_kind")
+                    == independent.get("manufacturing_hole_kind")
+                and record.get("manufacturing_hole_kind")
+                    == independent.get("manufacturing_hole_kind"))
             independent_classification_key = classification_key(independent) if independent else None
             classification_key_pass = (
                 independent_classification_key is not None
@@ -581,7 +728,7 @@ def main() -> int:
                 and recorded_fastener.get("body_side") == independent.get("body_side")
                 and recorded_fastener.get("body_extension_relation") == independent_extension_relation)
             source_geometry_pass = (
-                independent is not None and dimension_pass and hole_type_pass
+                independent is not None and dimension_pass and hole_type_pass and auxiliary_mark_pass
                 and classification_key_pass and exterior_fields_pass
                 and record.get("target_view") == independent_view
                 and anchor_3d_error is not None and anchor_3d_error <= GEOMETRY_TOLERANCE_MM
@@ -633,6 +780,11 @@ def main() -> int:
                             "exterior_fields_pass": exterior_fields_pass,
                             "independent_step_dimensions_mm": ({key: independent[key] for key in ("inner", "outer", "height")} if independent else None),
                             "dimension_pass": dimension_pass, "anchor_3d_error_mm": anchor_3d_error,
+                            "independent_auxiliary_mark_text": (independent.get("auxiliary_mark_text") if independent else None),
+                            "independent_thread_designation": (independent.get("thread_designation") if independent else None),
+                            "independent_manufacturing_hole_kind": (independent.get("manufacturing_hole_kind") if independent else None),
+                            "independent_auxiliary_mark_source": (independent.get("auxiliary_mark_source") if independent else None),
+                            "auxiliary_mark_pass": auxiliary_mark_pass,
                             "independent_hole_type": (independent.get("hole_type") if independent else None),
                             "independent_blind_hole_depth_mm": (independent.get("blind_hole_depth") if independent else None),
                             "independent_bore_topology_evidence": (independent.get("bore_topology_evidence") if independent else None),
@@ -668,6 +820,8 @@ def main() -> int:
             and exterior_overrides.get(item["source"]) not in EXPECTED_VIEWS)
         pending_bore_sources = sorted(item["source"] for item in independent_items
                                       if item.get("hole_type") not in {"through", "blind"})
+        mark_coverage = summarize_auxiliary_mark_coverage(independent_items)
+        pending_mark_sources = mark_coverage["invalid_or_missing_sources"]
         category_to_keys, key_to_categories = defaultdict(set), defaultdict(set)
         for source, independent in independent_by_source.items():
             category = str((fasteners_by_source.get(source) or {}).get("category") or "")
@@ -697,11 +851,14 @@ def main() -> int:
         extra_category_rows = sorted(set(row_by_category) - set(category_to_keys))
         if extra_category_rows:
             category_errors.append(f"extra category rows: {extra_category_rows}")
-        classification_pass = (not pending_bore_sources and not category_errors
+        classification_pass = (not pending_bore_sources and mark_coverage["pass"]
+                               and not category_errors
                                and len(category_to_keys) == len(row_by_category))
         step_geometry_pass = (source_hash_pass and not missing_step_sources and not extra_step_sources
                               and not pending_exterior_sources and not pending_bore_sources
+                              and not pending_mark_sources
                               and not invalid_exterior_overrides
+                              and not invalid_auxiliary_mark_inputs
                               and classification_pass
                               and len(record_by_source) == len(records)
                               and all(mapping["pass"] for mapping in view_mapping.values())
@@ -715,7 +872,7 @@ def main() -> int:
                        and not duplicate_outline_handles and not missing_outline_handles and not extra_outline_handles
                        and (no_fasteners_ok or (bool(records) and all(result["pass"] for result in results))))
         result = {
-            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v4",
+            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v7",
             "path": str(args.dxf.resolve()), "sha256": dxf_hash, "recorded_sha256": recorded_dxf_hash,
             "step_path": str(args.step.resolve()), "step_sha256": step_hash,
             "recorded_step_sha256": recorded_step_hash, "source_hash_pass": source_hash_pass,
@@ -727,8 +884,13 @@ def main() -> int:
             "independent_step_fastener_count": len(independent_items),
             "independent_pending_exterior_sources": pending_exterior_sources,
             "independent_pending_bore_sources": pending_bore_sources,
+            "independent_pending_auxiliary_mark_sources": pending_mark_sources,
+            "auxiliary_mark_coverage": mark_coverage,
+            "confirmed_auxiliary_mark_inputs": auxiliary_mark_inputs,
+            "invalid_auxiliary_mark_inputs": invalid_auxiliary_mark_inputs,
             "classification_key_fields": ["inner", "outer", "height", "hole_type",
-                                          "blind_hole_depth_if_blind"],
+                                          "blind_hole_depth_if_blind", "manufacturing_hole_kind",
+                                          "thread_designation_if_threaded"],
             "classification_pass": classification_pass,
             "classification_errors": category_errors,
             "user_confirmed_exterior_overrides": exterior_overrides,
