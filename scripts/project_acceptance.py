@@ -169,6 +169,13 @@ def main() -> int:
         and isinstance(item.get("outer"), (int, float)) and item["outer"] > 0
         and isinstance(item.get("inner"), (int, float)) and item["inner"] > 0
         and isinstance(item.get("height"), (int, float)) and item["height"] > 0
+        and item.get("hole_type") in {"through", "blind"}
+        and item.get("bore_continuity_confirmed") is True
+        and (item.get("hole_type") == "through"
+             or (isinstance(item.get("blind_hole_depth"), (int, float))
+                 and item["blind_hole_depth"] > 0))
+        and isinstance(item.get("classification_key"), list)
+        and len(item["classification_key"]) == 5
         and item.get("side") in EXPECTED_VIEWS
         and item.get("classification_status") == "confirmed"
         for item in fasteners
@@ -203,7 +210,12 @@ def main() -> int:
         and len(annotation_items) == len(fasteners)
         and len(annotation_tags) == len(set(annotation_tags))
         and set(annotation_tags) == set(tags)
-        and all(item.get("pass") is True for item in annotation_items)
+        and all(item.get("pass") is True
+                and item.get("hole_type") in {"through", "blind"}
+                and item.get("bore_continuity_confirmed") is True
+                and isinstance(item.get("classification_key"), list)
+                and len(item["classification_key"]) == 5
+                for item in annotation_items)
         and not annotation.get("extra_marker_handles")
         and not annotation.get("duplicate_marker_handles")
     )
@@ -215,6 +227,9 @@ def main() -> int:
         and stud_audit.get("step_sha256") == source_sha256
         and stud_audit.get("recorded_step_sha256") == source_sha256
         and stud_audit.get("step_geometry_pass") is True
+        and stud_audit.get("classification_pass") is True
+        and not stud_audit.get("classification_errors")
+        and not stud_audit.get("independent_pending_bore_sources")
         and stud_audit.get("independent_step_fastener_count") == len(fasteners)
         and stud_audit.get("recorded_fastener_count") == len(fasteners)
         and not stud_audit.get("missing_step_sources")
@@ -246,7 +261,7 @@ def main() -> int:
          "per_view_transforms": transforms,
          "annotation_validation": annotation,
          "independent_final_dxf_stud_audit": stud_audit},
-        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
+        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、安装孔、柱轴、压铆件自身通孔/盲孔拓扑及盲孔深度、完整分类键、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
 
     refs = fit.get("projection_reference_points") or {}
     projection = check.get("projection_validation") or {}
@@ -508,7 +523,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v5",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v6",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,

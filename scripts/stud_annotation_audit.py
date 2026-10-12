@@ -102,6 +102,53 @@ def point_on_axis_at(origin, axis, coordinate: float):
     return origin + axis * (coordinate - origin.dot(axis))
 
 
+def classify_axial_bore(shape, origin, axis, body_min: float, body_max: float) -> dict[str, Any]:
+    """Classify the coaxial bore from solid topology, not cylinder length."""
+    height = body_max - body_min
+    if height <= 0.0 or len(shape.Solids) != 1 or not shape.isValid():
+        return {"hole_type": "pending", "open_end_count": None,
+                "bore_continuity_confirmed": False, "blind_hole_depth": None,
+                "bore_open_side": None, "reason": "invalid_or_non_single_solid"}
+    margin = min(0.01, max(0.0005, height * 0.0005))
+    count = 129
+    coordinates = [body_min + margin + (height - 2.0 * margin) * i / (count - 1)
+                   for i in range(count)]
+    inside = [bool(shape.isInside(point_on_axis_at(origin, axis, coordinate), 1e-7, False))
+              for coordinate in coordinates]
+    transitions = [i for i in range(1, count) if inside[i] != inside[i - 1]]
+    low_open, high_open = not inside[0], not inside[-1]
+    evidence = {"sample_count": count, "inside_sample_count": sum(inside),
+                "transition_count": len(transitions), "low_end_open": low_open,
+                "high_end_open": high_open}
+    if low_open and high_open and not any(inside):
+        return {"hole_type": "through", "open_end_count": 2,
+                "bore_continuity_confirmed": True, "blind_hole_depth": None,
+                "bore_open_side": "both", "reason": "continuous_axis_void_between_both_ends",
+                "bore_topology_evidence": evidence}
+    if low_open != high_open and len(transitions) == 1:
+        transition = transitions[0]
+        low, high = coordinates[transition - 1], coordinates[transition]
+        low_inside = inside[transition - 1]
+        for _ in range(32):
+            middle = (low + high) / 2.0
+            middle_inside = bool(shape.isInside(point_on_axis_at(origin, axis, middle), 1e-7, False))
+            if middle_inside == low_inside:
+                low = middle
+            else:
+                high = middle
+        bottom = (low + high) / 2.0
+        depth = bottom - body_min if low_open else body_max - bottom
+        return {"hole_type": "blind", "open_end_count": 1,
+                "bore_continuity_confirmed": True, "blind_hole_depth": round(depth, 3),
+                "bore_open_side": "low" if low_open else "high",
+                "reason": "single_open_end_and_single_solid_bottom_transition",
+                "bore_topology_evidence": {**evidence, "bottom_coordinate": bottom}}
+    return {"hole_type": "pending", "open_end_count": int(low_open) + int(high_open),
+            "bore_continuity_confirmed": False, "blind_hole_depth": None,
+            "bore_open_side": None, "reason": "ambiguous_axis_void_topology",
+            "bore_topology_evidence": evidence}
+
+
 def cylinder_surfaces(shape):
     return [face.Surface for face in shape.Faces
             if type(face.Surface).__name__ == "Cylinder"
@@ -156,6 +203,7 @@ def rebuild_step_evidence(step_path: Path, App, Part):
                 rejected.append({"source": obj.Name, "reason": "empty_fastener_vertices"})
                 continue
             body_min, body_max = min(coordinates), max(coordinates)
+            bore = classify_axial_bore(obj.Shape, origin, axis, body_min, body_max)
             matches = []
             for sheet_name, face_index, surface, face in sheet_cylinders:
                 sheet_axis = canonical_axis(App, surface.Axis)
@@ -222,6 +270,7 @@ def rebuild_step_evidence(step_path: Path, App, Part):
                 "outer": round(2.0 * max(float(s.Radius) for s in coaxial), 2),
                 "inner": round(2.0 * min(float(s.Radius) for s in coaxial), 2),
                 "height": round(body_max - body_min, 3),
+                **bore,
                 "side": installation_outer_side,
                 "installation_outer_side": installation_outer_side,
                 "installation_outer_vector": ([exterior_direction.x, exterior_direction.y,
@@ -351,6 +400,40 @@ def close_number(a: Any, b: Any, tolerance: float) -> bool:
         return False
 
 
+def format_number(value: float) -> str:
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
+def classification_key(item: dict[str, Any]) -> tuple | None:
+    hole_type = item.get("hole_type")
+    if hole_type not in {"through", "blind"}:
+        return None
+    depth = round(float(item["blind_hole_depth"]), 3) if hole_type == "blind" else None
+    return (round(float(item["inner"]), 3), round(float(item["outer"]), 3),
+            round(float(item["height"]), 3), hole_type, depth)
+
+
+def recorded_classification_key(value: Any) -> tuple | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        return None
+    try:
+        hole_type = str(value[3])
+        if hole_type not in {"through", "blind"}:
+            return None
+        depth = round(float(value[4]), 3) if hole_type == "blind" else None
+        return (round(float(value[0]), 3), round(float(value[1]), 3),
+                round(float(value[2]), 3), hole_type, depth)
+    except (TypeError, ValueError):
+        return None
+
+
+def classification_spec(key: tuple) -> str:
+    inner, outer, height, hole_type, depth = key
+    base = f"M{format_number(inner)}*D{format_number(outer)}-H{format_number(height)}"
+    return (base + "-THRU" if hole_type == "through"
+            else base + f"-BLIND-DP{format_number(depth)}")
+
+
 def main() -> int:
     args = parse_args()
     for path, label in ((args.dxf, "DXF"), (args.step, "STEP/STP"), (args.check, "check record")):
@@ -462,6 +545,25 @@ def main() -> int:
             recorded_fastener = fasteners_by_source.get(source, {})
             dimension_pass = independent is not None and all(close_number(recorded_fastener.get(key), independent.get(key), DIMENSION_TOLERANCE_MM)
                                                              for key in ("outer", "inner", "height"))
+            independent_classification_key = classification_key(independent) if independent else None
+            classification_key_pass = (
+                independent_classification_key is not None
+                and recorded_classification_key(recorded_fastener.get("classification_key"))
+                    == independent_classification_key
+                and recorded_classification_key(record.get("classification_key"))
+                    == independent_classification_key)
+            hole_type_pass = (
+                independent is not None
+                and independent.get("hole_type") in {"through", "blind"}
+                and recorded_fastener.get("hole_type") == independent.get("hole_type")
+                and recorded_fastener.get("bore_continuity_confirmed") is True
+                and record.get("hole_type") == independent.get("hole_type")
+                and record.get("bore_continuity_confirmed") is True
+                and (independent.get("hole_type") == "through"
+                     or (close_number(recorded_fastener.get("blind_hole_depth"),
+                                      independent.get("blind_hole_depth"), DIMENSION_TOLERANCE_MM)
+                         and close_number(record.get("blind_hole_depth"),
+                                          independent.get("blind_hole_depth"), DIMENSION_TOLERANCE_MM))))
             anchor_3d_error = distance3(record.get("anchor_3d"), independent.get("anchor_3d")) if independent else None
             hole_range_error = None
             if independent is not None:
@@ -479,7 +581,8 @@ def main() -> int:
                 and recorded_fastener.get("body_side") == independent.get("body_side")
                 and recorded_fastener.get("body_extension_relation") == independent_extension_relation)
             source_geometry_pass = (
-                independent is not None and dimension_pass and exterior_fields_pass
+                independent is not None and dimension_pass and hole_type_pass
+                and classification_key_pass and exterior_fields_pass
                 and record.get("target_view") == independent_view
                 and anchor_3d_error is not None and anchor_3d_error <= GEOMETRY_TOLERANCE_MM
                 and hole_range_error is not None and hole_range_error <= GEOMETRY_TOLERANCE_MM
@@ -530,6 +633,13 @@ def main() -> int:
                             "exterior_fields_pass": exterior_fields_pass,
                             "independent_step_dimensions_mm": ({key: independent[key] for key in ("inner", "outer", "height")} if independent else None),
                             "dimension_pass": dimension_pass, "anchor_3d_error_mm": anchor_3d_error,
+                            "independent_hole_type": (independent.get("hole_type") if independent else None),
+                            "independent_blind_hole_depth_mm": (independent.get("blind_hole_depth") if independent else None),
+                            "independent_bore_topology_evidence": (independent.get("bore_topology_evidence") if independent else None),
+                            "hole_type_pass": hole_type_pass,
+                            "independent_classification_key": (list(independent_classification_key)
+                                                               if independent_classification_key else None),
+                            "classification_key_pass": classification_key_pass,
                             "installation_hole_range_error_mm": hole_range_error,
                             "independent_expected_sheet_position_mm": expected_anchor,
                             "actual_sheet_position_mm": list(actual_anchor) if actual_anchor is not None else None,
@@ -556,8 +666,43 @@ def main() -> int:
             item["source"] for item in independent_items
             if item.get("exterior_side_status") != "confirmed"
             and exterior_overrides.get(item["source"]) not in EXPECTED_VIEWS)
+        pending_bore_sources = sorted(item["source"] for item in independent_items
+                                      if item.get("hole_type") not in {"through", "blind"})
+        category_to_keys, key_to_categories = defaultdict(set), defaultdict(set)
+        for source, independent in independent_by_source.items():
+            category = str((fasteners_by_source.get(source) or {}).get("category") or "")
+            key = classification_key(independent)
+            if category and key is not None:
+                category_to_keys[category].add(key)
+                key_to_categories[key].add(category)
+        category_rows = check.get("category_rows") or []
+        row_by_category = {str(row.get("class") or ""): row for row in category_rows
+                           if isinstance(row, dict) and row.get("class")}
+        category_errors = []
+        for category, keys in sorted(category_to_keys.items()):
+            if len(keys) != 1:
+                category_errors.append(f"category {category} contains {len(keys)} classification keys")
+                continue
+            key = next(iter(keys))
+            row = row_by_category.get(category)
+            expected_total = sum(1 for item in (check.get("fasteners") or [])
+                                 if str(item.get("category") or "") == category)
+            expected_spec = classification_spec(key)
+            if row is None or row.get("spec") != expected_spec or int(row.get("total", -1)) != expected_total:
+                category_errors.append(f"category {category} row must be {expected_spec} x {expected_total}")
+        for key, categories in key_to_categories.items():
+            if len(categories) != 1:
+                category_errors.append(
+                    f"classification key {classification_spec(key)} split across {sorted(categories)}")
+        extra_category_rows = sorted(set(row_by_category) - set(category_to_keys))
+        if extra_category_rows:
+            category_errors.append(f"extra category rows: {extra_category_rows}")
+        classification_pass = (not pending_bore_sources and not category_errors
+                               and len(category_to_keys) == len(row_by_category))
         step_geometry_pass = (source_hash_pass and not missing_step_sources and not extra_step_sources
-                              and not pending_exterior_sources and not invalid_exterior_overrides
+                              and not pending_exterior_sources and not pending_bore_sources
+                              and not invalid_exterior_overrides
+                              and classification_pass
                               and len(record_by_source) == len(records)
                               and all(mapping["pass"] for mapping in view_mapping.values())
                               and (not records or all(result["source_geometry_pass"] for result in results)))
@@ -570,7 +715,7 @@ def main() -> int:
                        and not duplicate_outline_handles and not missing_outline_handles and not extra_outline_handles
                        and (no_fasteners_ok or (bool(records) and all(result["pass"] for result in results))))
         result = {
-            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v3",
+            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v4",
             "path": str(args.dxf.resolve()), "sha256": dxf_hash, "recorded_sha256": recorded_dxf_hash,
             "step_path": str(args.step.resolve()), "step_sha256": step_hash,
             "recorded_step_sha256": recorded_step_hash, "source_hash_pass": source_hash_pass,
@@ -581,6 +726,11 @@ def main() -> int:
             "independent_candidate_count": step_evidence["candidate_count"],
             "independent_step_fastener_count": len(independent_items),
             "independent_pending_exterior_sources": pending_exterior_sources,
+            "independent_pending_bore_sources": pending_bore_sources,
+            "classification_key_fields": ["inner", "outer", "height", "hole_type",
+                                          "blind_hole_depth_if_blind"],
+            "classification_pass": classification_pass,
+            "classification_errors": category_errors,
             "user_confirmed_exterior_overrides": exterior_overrides,
             "invalid_exterior_overrides": invalid_exterior_overrides,
             "independent_rejected_candidates": step_evidence["rejected"],
