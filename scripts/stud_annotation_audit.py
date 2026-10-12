@@ -13,13 +13,13 @@ import re
 import sys
 from typing import Any
 
+from projection_transform import model_side_names, orient_projected_xy, view_directions
+
 
 EXPECTED_VIEWS = {"TOP", "BOTTOM", "FRONT", "REAR", "LEFT", "RIGHT"}
-VIEW_DIRECTIONS = {
-    "FRONT": (0.0, -1.0, 0.0), "REAR": (0.0, 1.0, 0.0),
-    "RIGHT": (1.0, 0.0, 0.0), "LEFT": (-1.0, 0.0, 0.0),
-    "TOP": (0.0, 0.0, 1.0), "BOTTOM": (0.0, 0.0, -1.0),
-}
+FRONT_SOURCE = "FRONT"
+VIEW_DIRECTIONS = view_directions(FRONT_SOURCE)
+SIDE_NAMES = model_side_names(FRONT_SOURCE)
 ENABLED_HLR_GROUPS = {0, 3, 5, 8}
 ANCHOR_TYPES = {"POINT", "CIRCLE", "INSERT"}
 TAG_TYPES = {"TEXT", "MTEXT", "ATTRIB"}
@@ -87,8 +87,18 @@ def distance3(a: Any, b: Any) -> float | None:
 def side_from_vector(vector) -> str:
     values = (float(vector.x), float(vector.y), float(vector.z))
     axis = max(range(3), key=lambda i: abs(values[i]))
-    names = (("RIGHT", "LEFT"), ("REAR", "FRONT"), ("TOP", "BOTTOM"))
-    return names[axis][0 if values[axis] > 0 else 1]
+    return SIDE_NAMES[axis][0 if values[axis] > 0 else 1]
+
+
+def configure_view_basis(front_source: str) -> None:
+    """Configure drawing-view directions from the selected FreeCAD standard front."""
+    global FRONT_SOURCE, VIEW_DIRECTIONS, SIDE_NAMES
+    FRONT_SOURCE = front_source.upper()
+    try:
+        VIEW_DIRECTIONS = view_directions(FRONT_SOURCE)
+        SIDE_NAMES = model_side_names(FRONT_SOURCE)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def canonical_axis(App, vector):
@@ -320,7 +330,7 @@ def rebuild_step_evidence(step_path: Path, App, Part):
 def project_point(Part, TechDraw, App, view: str, point: list[float]):
     groups = TechDraw.projectEx(Part.makeSphere(0.05, App.Vector(*point)),
                                 App.Vector(*VIEW_DIRECTIONS[view]))
-    centers = [(float(edge.Curve.Center.x), float(edge.Curve.Center.y))
+    centers = [orient2(view, float(edge.Curve.Center.x), float(edge.Curve.Center.y))
                for group in groups for edge in group.Edges
                if type(edge.Curve).__name__ == "Circle"]
     if not centers:
@@ -334,13 +344,17 @@ def project_bbox(TechDraw, App, shape, view: str):
     points = []
     for group_index in ENABLED_HLR_GROUPS:
         for edge in groups[group_index].Edges:
-            points.extend((float(v.Point.x), float(v.Point.y)) for v in edge.Vertexes)
+            points.extend(orient2(view, float(v.Point.x), float(v.Point.y)) for v in edge.Vertexes)
             if not edge.Vertexes:
-                points.extend((float(p.x), float(p.y)) for p in edge.discretize(Deflection=0.16))
+                points.extend(orient2(view, float(p.x), float(p.y)) for p in edge.discretize(Deflection=0.16))
     if not points:
         raise RuntimeError(f"No independent projected geometry in {view}")
     xs, ys = [p[0] for p in points], [p[1] for p in points]
     return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def orient2(view: str, x: float, y: float):
+    return orient_projected_xy(FRONT_SOURCE, view, x, y)
 
 
 def entity_position(entity):
@@ -560,6 +574,7 @@ def main() -> int:
         if not path.is_file():
             raise SystemExit(f"{label} does not exist: {path}")
     check = json.loads(args.check.read_text(encoding="utf-8"))
+    configure_view_basis(str(check.get("front_source") or "FRONT"))
     validation = check.get("annotation_validation") or {}
     records = validation.get("per_item") or []
     confirmed_inputs = check.get("confirmed_inputs") or {}
@@ -644,12 +659,11 @@ def main() -> int:
             if independent is not None and independent_view is None and override_view in EXPECTED_VIEWS:
                 independent_view = override_view
                 independent_exterior_basis = "user_confirmed"
-                body_vector = independent.get("body_side_vector") or []
-                view_vector = VIEW_DIRECTIONS[override_view]
-                if len(body_vector) == 3:
-                    dot = sum(float(body_vector[i]) * view_vector[i] for i in range(3))
-                    independent_extension_relation = ("outward" if dot > 0.5 else
-                                                      "inward" if dot < -0.5 else "pending")
+                independent["installation_outer_side"] = override_view
+                independent["exterior_side_status"] = "confirmed_by_user"
+                independent["exterior_side_basis"] = "user_confirmed"
+                independent_extension_relation = (
+                    "outward" if independent.get("body_side") == override_view else "inward")
             anchor_handle, tag_handle = str(record.get("anchor_entity_handle") or ""), str(record.get("tag_text_handle") or "")
             outline_handles = [str(handle) for handle in (record.get("outline_entity_handles") or [])]
             anchor_entity = doc.entitydb.get(anchor_handle) if anchor_handle else None

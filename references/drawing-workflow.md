@@ -22,6 +22,7 @@
 
 1. 按[投影简化与复杂度控制](projection-complexity.md)建立可追溯绘图副本，抑制非功能细节并执行 HLR。生成 DRAWING `TOP/BOTTOM/FRONT/REAR/LEFT/RIGHT` 六个正投影；输出可见实线、隐藏虚线和中心线，不使用透明面或全边实线代替消隐。
 2. 固定第三角法布局：FRONT 居中，TOP 上、BOTTOM 下、LEFT 左、RIGHT 右、REAR 在 RIGHT 外侧。TOP/FRONT/BOTTOM 共用竖向投影基准，LEFT/FRONT/RIGHT/REAR 共用横向投影基准；六图同一比例。用至少三个不共线特征检查每个视图的方向、朝上关系和镜像。
+   对六个轴对齐标准视图，生成源必须导入 `scripts/projection_transform.py`，并把所有 `TechDraw.projectEx()` 返回点统一传入 `orient_projected_xy()`；禁止在项目脚本中另写仅交换 TOP/BOTTOM 的临时规则。
 3. 按[特征尺寸标注清单](feature-dimensions.md)建立六视图尺寸覆盖。每项尺寸记录源特征、测量基准、未舍入值、显示值、符号、目标视图和 DXF 实体。压铆三维锚点取柱轴与安装板外表面/局部板厚中面的交点，并使用与 HLR 几何相同的视图变换投到安装板外表面视图；柱身向内延伸时也不得改投到柱身侧。禁止用包围盒中心或逐视图手写坐标公式。隐藏特征无法清楚表达时，可在同一图幅增加局部图或剖视，但不得取代六个主视图。
 4. 保存 HLR 原始/优化统计、几何等价检查、`dimension_validation` 和 `annotation_validation`。后者逐件绑定源实例、安装孔、目标视图、变换标识、期望图幅坐标、DXF 锚点/位号 handle 及回读偏差；改变方向、简化策略、特征识别、比例或排布后重做本阶段。
 
