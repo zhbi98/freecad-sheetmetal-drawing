@@ -17,6 +17,7 @@ EXPECTED_AUTOMATIC_CODES = {f"A{i:02d}" for i in range(1, 12)}
 VALID_REVIEW = ("pass", "fail", "pending")
 HEIGHT_BASIS = "press_in_back_face_to_free_end_includes_local_sheet_thickness"
 HEIGHT_TOLERANCE_MM = 0.03
+SUPPLEMENTARY_POLICY = "main_views_only_unless_traceable_and_necessary"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -407,6 +408,26 @@ def main() -> int:
         and bool(style_validation.get("dimstyle_names"))
     )
     feature_record = check.get("feature_annotation_validation") or {}
+    supplementary_record = check.get("supplementary_view_validation") or {}
+    supplementary_views = supplementary_record.get("per_view")
+    supplementary_audit = feature_audit.get("supplementary_view_validation") or {}
+    supplementary_ok = (
+        supplementary_record.get("policy") == SUPPLEMENTARY_POLICY
+        and isinstance(supplementary_record.get("declared_count"), int)
+        and not isinstance(supplementary_record.get("declared_count"), bool)
+        and isinstance(supplementary_views, list)
+        and supplementary_record.get("declared_count") == len(supplementary_views)
+        and supplementary_record.get("pass") is True
+        and supplementary_audit.get("policy") == SUPPLEMENTARY_POLICY
+        and supplementary_audit.get("declared_count") == len(supplementary_views)
+        and supplementary_audit.get("recorded_view_count") == len(supplementary_views)
+        and supplementary_audit.get("actual_label_count") == 2 * len(supplementary_views)
+        and not supplementary_audit.get("duplicate_ids")
+        and not supplementary_audit.get("duplicate_declared_label_handles")
+        and not supplementary_audit.get("unregistered_actual_label_handles")
+        and not supplementary_audit.get("missing_declared_label_handles")
+        and supplementary_audit.get("pass") is True
+    )
     feature_audit_ok = (
         feature_audit.get("pass") is True and feature_audit.get("status") == "pass"
         and same_dxf_path(feature_audit.get("path"))
@@ -420,6 +441,7 @@ def main() -> int:
         and feature_record.get("displayed_group_callouts") == 0
         and feature_audit.get("record_policy_ok") is True
         and not feature_audit.get("forbidden_callout_handles")
+        and supplementary_ok
     )
     dimensions_ok = (dimensions.get("pass") is True and native_style_ok
                      and set(dimension_views) == EXPECTED_VIEWS and feature_record.get("pass") is True
@@ -432,13 +454,15 @@ def main() -> int:
             and entry.get("pass") is True
             for entry in dimension_views.values()
         )
-    add("A07", "六视图尺寸覆盖与模型回算", "automatic", "pass" if dimensions_ok else "fail",
+    add("A07", "六视图尺寸覆盖、补充视图追溯与模型回算", "automatic", "pass" if dimensions_ok else "fail",
         {"views": sorted(dimension_views), "per_view": dimension_views,
          "style_validation": style_validation,
          "feature_annotation_validation": feature_record,
+         "supplementary_view_validation": supplementary_record,
+         "independent_supplementary_view_audit": supplementary_audit,
          "independent_step_to_dxf_feature_audit": feature_audit,
          "violations": dimensions.get("violations"), "pass": dimensions.get("pass")},
-        "若仅漏标则补齐缺失的原生 DIMENSION/孔标并保留已有正确标注；否则按特征清单修正样式、定位、数值或上游识别后重新导出。")
+        "若仅漏标则补齐缺失的原生 DIMENSION/孔标并保留已有正确标注；删除无必要或无法双向追溯的局部图/剖视；确有必要时补齐主视图来源范围、观察/剖切方向、匹配编号、比例、STEP 特征和实体 handle，再重新导出。")
 
     table = check.get("table_layout") or {}
     edge_attachment = table.get("edge_attachment") or {}
@@ -597,7 +621,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v15",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v16",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,
