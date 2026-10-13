@@ -15,6 +15,8 @@ from typing import Any
 EXPECTED_VIEWS = {"TOP", "BOTTOM", "FRONT", "REAR", "LEFT", "RIGHT"}
 EXPECTED_AUTOMATIC_CODES = {f"A{i:02d}" for i in range(1, 12)}
 VALID_REVIEW = ("pass", "fail", "pending")
+HEIGHT_BASIS = "press_in_back_face_to_free_end_includes_local_sheet_thickness"
+HEIGHT_TOLERANCE_MM = 0.03
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -71,6 +73,35 @@ def calibrated_transform_ok(entry: Any, tolerance: float) -> bool:
     return (
         noncollinear and isinstance(entry.get("max_residual_mm"), (int, float))
         and 0 <= entry["max_residual_mm"] <= tolerance and entry.get("pass") is True
+    )
+
+
+def installed_height_record_ok(item: Any) -> bool:
+    """Validate the project convention: press-in back face to free end."""
+    if not isinstance(item, dict) or item.get("height_basis") != HEIGHT_BASIS:
+        return False
+    fields = (
+        "height",
+        "local_sheet_thickness_mm",
+        "body_side_exposed_height_mm",
+        "press_in_back_face_coordinate",
+        "free_end_coordinate",
+    )
+    if not all(isinstance(item.get(key), (int, float))
+               and not isinstance(item.get(key), bool)
+               and math.isfinite(float(item[key])) for key in fields):
+        return False
+    height = float(item["height"])
+    by_sum = (float(item["body_side_exposed_height_mm"])
+              + float(item["local_sheet_thickness_mm"]))
+    by_coordinates = abs(float(item["free_end_coordinate"])
+                         - float(item["press_in_back_face_coordinate"]))
+    return (
+        height > 0.0
+        and float(item["local_sheet_thickness_mm"]) > 0.0
+        and float(item["body_side_exposed_height_mm"]) > 0.0
+        and abs(height - by_sum) <= HEIGHT_TOLERANCE_MM
+        and abs(height - by_coordinates) <= HEIGHT_TOLERANCE_MM
     )
 
 
@@ -168,7 +199,7 @@ def main() -> int:
         item.get("category") and item.get("tag")
         and isinstance(item.get("outer"), (int, float)) and item["outer"] > 0
         and isinstance(item.get("inner"), (int, float)) and item["inner"] > 0
-        and isinstance(item.get("height"), (int, float)) and item["height"] > 0
+        and installed_height_record_ok(item)
         and item.get("hole_type") in {"through", "blind"}
         and item.get("bore_continuity_confirmed") is True
         and (item.get("hole_type") == "through"
@@ -233,6 +264,7 @@ def main() -> int:
                          and item.get("thread_designation") is None))
                 and isinstance(item.get("classification_key"), list)
                 and len(item["classification_key"]) == 7
+                and installed_height_record_ok(item)
                 for item in annotation_items)
         and not annotation.get("extra_marker_handles")
         and not annotation.get("duplicate_marker_handles")
@@ -277,6 +309,9 @@ def main() -> int:
         and not stud_audit.get("missing_outline_handles")
         and not stud_audit.get("extra_outline_handles")
         and not stud_audit.get("duplicate_outline_handles")
+        and stud_audit.get("height_basis") == HEIGHT_BASIS
+        and all(item.get("height_basis_pass") is True
+                for item in (stud_audit.get("items") or []))
         and all(item.get("outline_geometry_and_color_pass") is True
                 for item in (stud_audit.get("items") or []))
     )
@@ -294,7 +329,7 @@ def main() -> int:
          "per_view_transforms": transforms,
          "annotation_validation": annotation,
          "independent_final_dxf_stud_audit": stud_audit},
-        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、3D 辅助字符串及其中的螺纹规格、安装孔、柱轴、压铆件自身通孔/盲孔拓扑及盲孔深度、完整分类键、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
+        "若仅漏标则补齐缺失锚点/位号并保留已有正确标注；否则重新确认候选、3D 辅助字符串及其中的螺纹规格、安装孔、柱轴、局部板厚、柱身侧露出量、压铆进入背面到柱端的安装总高度、压铆件自身通孔/盲孔拓扑及盲孔深度、完整分类键、安装板外表面、柱身内外延伸和坐标变换，修复后重新导出并复查。")
 
     refs = fit.get("projection_reference_points") or {}
     projection = check.get("projection_validation") or {}
@@ -556,7 +591,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v9",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v10",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,

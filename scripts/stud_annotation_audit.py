@@ -25,6 +25,7 @@ ANCHOR_TYPES = {"POINT", "CIRCLE", "INSERT"}
 TAG_TYPES = {"TEXT", "MTEXT", "ATTRIB"}
 DIMENSION_TOLERANCE_MM = 0.03
 GEOMETRY_TOLERANCE_MM = 0.03
+HEIGHT_BASIS = "press_in_back_face_to_free_end_includes_local_sheet_thickness"
 
 
 def parse_args() -> argparse.Namespace:
@@ -243,12 +244,24 @@ def rebuild_step_evidence(step_path: Path, App, Part):
             match = matches[0]
             sheet_min, sheet_max = match["sheet_min"], match["sheet_max"]
             midplane = (sheet_min + sheet_max) / 2.0
+            sheet_thickness = sheet_max - sheet_min
             low_protrusion = max(0.0, sheet_min - body_min)
             high_protrusion = max(0.0, body_max - sheet_max)
             if max(low_protrusion, high_protrusion) <= 0.05 or abs(low_protrusion - high_protrusion) <= 0.05:
                 rejected.append({"source": obj.Name, "reason": "ambiguous_body_side"})
                 continue
-            body_direction = -axis if low_protrusion > high_protrusion else axis
+            body_is_low = low_protrusion > high_protrusion
+            body_direction = -axis if body_is_low else axis
+            body_side_exposed_height = low_protrusion if body_is_low else high_protrusion
+            press_in_back_face_coordinate = sheet_max if body_is_low else sheet_min
+            free_end_coordinate = body_min if body_is_low else body_max
+            installed_height_by_sum = body_side_exposed_height + sheet_thickness
+            installed_height_by_coordinates = abs(
+                free_end_coordinate - press_in_back_face_coordinate)
+            if abs(installed_height_by_sum - installed_height_by_coordinates) > GEOMETRY_TOLERANCE_MM:
+                rejected.append({"source": obj.Name,
+                                 "reason": "inconsistent_installed_height_basis"})
+                continue
             anchor = point_on_axis_at(origin, axis, midplane)
             # A target annotation view is the installation panel's exterior
             # view, not necessarily the side on which the stud body extends.
@@ -258,7 +271,6 @@ def rebuild_step_evidence(step_path: Path, App, Part):
             # pending instead of being guessed from an axis sign or body side.
             assembly_coordinates = [point.dot(axis) for point in sheet_vertices]
             assembly_min, assembly_max = min(assembly_coordinates), max(assembly_coordinates)
-            sheet_thickness = sheet_max - sheet_min
             exterior_tolerance = max(0.15, min(0.50, sheet_thickness * 0.25))
             low_is_envelope = abs(sheet_min - assembly_min) <= exterior_tolerance
             high_is_envelope = abs(assembly_max - sheet_max) <= exterior_tolerance
@@ -280,7 +292,13 @@ def rebuild_step_evidence(step_path: Path, App, Part):
                 "anchor_3d": [anchor.x, anchor.y, anchor.z],
                 "outer": round(2.0 * max(float(s.Radius) for s in coaxial), 2),
                 "inner": round(2.0 * min(float(s.Radius) for s in coaxial), 2),
-                "height": round(body_max - body_min, 3),
+                "height": round(installed_height_by_coordinates, 3),
+                "height_basis": HEIGHT_BASIS,
+                "local_sheet_thickness_mm": round(sheet_thickness, 3),
+                "body_side_exposed_height_mm": round(body_side_exposed_height, 3),
+                "press_in_back_face_coordinate": round(press_in_back_face_coordinate, 6),
+                "free_end_coordinate": round(free_end_coordinate, 6),
+                "entity_axial_length_mm": round(body_max - body_min, 3),
                 **bore,
                 "side": installation_outer_side,
                 "installation_outer_side": installation_outer_side,
@@ -316,8 +334,9 @@ def rebuild_step_evidence(step_path: Path, App, Part):
             axis = App.Vector(*item["axis_direction"])
             origin = App.Vector(*item["axis_origin"])
             base = point_on_axis_at(origin, axis, item["body_axial_range"][0])
-            outer = Part.makeCylinder(item["outer"] / 2.0, item["height"], base, axis)
-            inner = Part.makeCylinder(item["inner"] / 2.0, item["height"], base, axis)
+            entity_length = item["entity_axial_length_mm"]
+            outer = Part.makeCylinder(item["outer"] / 2.0, entity_length, base, axis)
+            inner = Part.makeCylinder(item["inner"] / 2.0, entity_length, base, axis)
             simple_shapes.append(outer.cut(inner))
         return {"objects": len(objects), "sheets": [obj.Name for obj in sheets],
                 "candidate_count": len(candidates), "confirmed": confirmed,
@@ -413,6 +432,33 @@ def close_number(a: Any, b: Any, tolerance: float) -> bool:
         return math.isfinite(float(a)) and math.isfinite(float(b)) and abs(float(a) - float(b)) <= tolerance
     except (TypeError, ValueError):
         return False
+
+
+def height_evidence_matches(record: Any, independent: dict[str, Any]) -> bool:
+    """Require the project installed-height basis, not a bare fastener span."""
+    if not isinstance(record, dict) or record.get("height_basis") != HEIGHT_BASIS:
+        return False
+    numeric_fields = (
+        "height",
+        "local_sheet_thickness_mm",
+        "body_side_exposed_height_mm",
+        "press_in_back_face_coordinate",
+        "free_end_coordinate",
+    )
+    if not all(close_number(record.get(key), independent.get(key), DIMENSION_TOLERANCE_MM)
+               for key in numeric_fields):
+        return False
+    try:
+        height = float(record["height"])
+        by_sum = (float(record["body_side_exposed_height_mm"])
+                  + float(record["local_sheet_thickness_mm"]))
+        by_coordinates = abs(float(record["free_end_coordinate"])
+                             - float(record["press_in_back_face_coordinate"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (height > 0.0
+            and abs(height - by_sum) <= DIMENSION_TOLERANCE_MM
+            and abs(height - by_coordinates) <= DIMENSION_TOLERANCE_MM)
 
 
 def format_number(value: float) -> str:
@@ -687,8 +733,14 @@ def main() -> int:
                         inside = actual_anchor is not None and paper_box[0] - tolerance_value <= actual_anchor[0] <= paper_box[2] + tolerance_value and paper_box[1] - tolerance_value <= actual_anchor[1] <= paper_box[3] + tolerance_value
                         tag_inside = actual_tag is not None and paper_box[0] - tolerance_value <= actual_tag[0] <= paper_box[2] + tolerance_value and paper_box[1] - tolerance_value <= actual_tag[1] <= paper_box[3] + tolerance_value
             recorded_fastener = fasteners_by_source.get(source, {})
-            dimension_pass = independent is not None and all(close_number(recorded_fastener.get(key), independent.get(key), DIMENSION_TOLERANCE_MM)
-                                                             for key in ("outer", "inner", "height"))
+            dimension_pass = (
+                independent is not None
+                and all(close_number(recorded_fastener.get(key), independent.get(key),
+                                     DIMENSION_TOLERANCE_MM)
+                        for key in ("outer", "inner"))
+                and height_evidence_matches(recorded_fastener, independent)
+                and height_evidence_matches(record, independent)
+            )
             auxiliary_mark_pass = (
                 independent is not None
                 and independent.get("mark_status") == "confirmed"
@@ -793,6 +845,14 @@ def main() -> int:
                             "independent_exterior_side_evidence": (independent.get("exterior_side_evidence") if independent else None),
                             "exterior_fields_pass": exterior_fields_pass,
                             "independent_step_dimensions_mm": ({key: independent[key] for key in ("inner", "outer", "height")} if independent else None),
+                            "independent_height_evidence": ({key: independent[key] for key in (
+                                "height_basis", "local_sheet_thickness_mm",
+                                "body_side_exposed_height_mm", "press_in_back_face_coordinate",
+                                "free_end_coordinate", "entity_axial_length_mm")}
+                                if independent else None),
+                            "height_basis_pass": (independent is not None
+                                                  and height_evidence_matches(recorded_fastener, independent)
+                                                  and height_evidence_matches(record, independent)),
                             "dimension_pass": dimension_pass, "anchor_3d_error_mm": anchor_3d_error,
                             "independent_auxiliary_mark_text": (independent.get("auxiliary_mark_text") if independent else None),
                             "independent_thread_designation": (independent.get("thread_designation") if independent else None),
@@ -886,7 +946,7 @@ def main() -> int:
                        and not duplicate_outline_handles and not missing_outline_handles and not extra_outline_handles
                        and (no_fasteners_ok or (bool(records) and all(result["pass"] for result in results))))
         result = {
-            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v7",
+            "schema": "freecad-sheetmetal-drawing/stud-annotation-audit/v8",
             "path": str(args.dxf.resolve()), "sha256": dxf_hash, "recorded_sha256": recorded_dxf_hash,
             "step_path": str(args.step.resolve()), "step_sha256": step_hash,
             "recorded_step_sha256": recorded_step_hash, "source_hash_pass": source_hash_pass,
@@ -902,7 +962,8 @@ def main() -> int:
             "auxiliary_mark_coverage": mark_coverage,
             "confirmed_auxiliary_mark_inputs": auxiliary_mark_inputs,
             "invalid_auxiliary_mark_inputs": invalid_auxiliary_mark_inputs,
-            "classification_key_fields": ["inner", "outer", "height", "hole_type",
+            "height_basis": HEIGHT_BASIS,
+            "classification_key_fields": ["inner", "outer", "installed_height_including_local_sheet_thickness", "hole_type",
                                           "blind_hole_depth_if_blind", "manufacturing_hole_kind",
                                           "thread_designation_if_threaded"],
             "classification_pass": classification_pass,

@@ -11,8 +11,7 @@ import math
 from pathlib import Path
 import sys
 
-
-AXIS_VIEW = {"X": "RIGHT", "Y": "FRONT", "Z": "TOP"}
+from projection_transform import model_side_names
 
 
 def parse_args():
@@ -61,7 +60,7 @@ def canonical_axis(App, vector):
     return -axis if values[dominant] < 0 else axis
 
 
-def independent_groups(step: Path, App, Part):
+def independent_groups(step: Path, App, Part, axis_view):
     document = App.newDocument("independent_feature_annotation_audit")
     try:
         Part.insert(str(step.resolve()), document.Name)
@@ -104,7 +103,7 @@ def independent_groups(step: Path, App, Part):
         return [{
             "group_id": f"{axis}_D{fmt(diameter)}",
             "axis": axis, "diameter": diameter, "count": count,
-            "target_view": AXIS_VIEW[axis],
+            "target_view": axis_view[axis],
         } for (axis, diameter), count in sorted(grouped.items())], len(holes)
     finally:
         App.closeDocument(document.Name)
@@ -115,10 +114,12 @@ def main() -> int:
     for path, label in ((args.step, "STEP"), (args.dxf, "DXF"), (args.check, "check")):
         if not path.is_file():
             raise SystemExit(f"{label} does not exist: {path}")
-    ezdxf, App, Part = load_dependencies(args.vendor_path)
-    expected, feature_count = independent_groups(args.step, App, Part)
-    expected_by_id = {entry["group_id"]: entry for entry in expected}
     check = json.loads(args.check.read_text(encoding="utf-8"))
+    side_names = model_side_names(str(check.get("front_source") or "FRONT"))
+    axis_view = {axis: side_names[index][0] for index, axis in enumerate("XYZ")}
+    ezdxf, App, Part = load_dependencies(args.vendor_path)
+    expected, feature_count = independent_groups(args.step, App, Part, axis_view)
+    expected_by_id = {entry["group_id"]: entry for entry in expected}
     recorded = (check.get("feature_annotation_validation") or {}).get("per_group") or []
     recorded_by_id = {str(entry.get("group_id") or ""): entry for entry in recorded}
     document = ezdxf.readfile(args.dxf)
