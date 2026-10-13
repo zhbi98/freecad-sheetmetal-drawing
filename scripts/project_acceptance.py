@@ -463,6 +463,8 @@ def main() -> int:
         and not text_audit.get("missing_handles")
         and not text_audit.get("stale_handles")
         and (text_audit.get("font_validation") or {}).get("pass") is True
+        and (text_audit.get("technical_requirements_validation") or {}).get("pass") is True
+        and (text_audit.get("unnoted_tolerance_validation") or {}).get("pass") is True
         and (text_audit.get("containment") or {}).get("pass") is True
         and (text_audit.get("containment") or {}).get("bbox_fail_count") == 0
         and (text_audit.get("containment") or {}).get("outside_cell_count") == 0
@@ -475,9 +477,11 @@ def main() -> int:
          "minimum_actual_padding_mm": table.get("minimum_actual_padding_mm"),
          "edge_attachment": edge_attachment, "text_cell_height_ratio": height_ratio,
          "text_cell_containment": containment,
+         "technical_requirements_validation": text_audit.get("technical_requirements_validation"),
+         "unnoted_tolerance_validation": text_audit.get("unnoted_tolerance_validation"),
           "independent_final_dxf_text_audit": text_audit,
          "violations": table.get("violations")},
-        "把表格重新锚定到图框边，给表名设置独立合并行，并按最终字体字形包围框重算基线、字号、行高、列宽和合并网格，确保文字不压线或跨格。")
+        "恢复左下角固定技术要求全文，把表格重新锚定到图框边，恢复已确认模板或 Skill 默认未注公差值，并按最终字体字形包围框重算基线、字号、行高、列宽和合并网格，确保文字不压线或跨格。")
 
     readback = check.get("readback") or {}
     dxf_ok = (
@@ -497,6 +501,7 @@ def main() -> int:
         and perf.get("duplicate_polylines_same_layer") == 0 and perf.get("nonfinite_points") == 0
         and perf.get("visible_hidden_exact_overlap") == 0
         and (perf.get("linetype_validation") or {}).get("pass") is True
+        and (perf.get("color_validation") or {}).get("pass") is True
     )
     geometry_export = projection.get("geometry_export") or {}
     linetype = projection.get("linetype_validation") or {}
@@ -516,9 +521,10 @@ def main() -> int:
          "duplicate_polylines": perf.get("duplicate_polylines_same_layer"),
          "visible_hidden_exact_overlap": perf.get("visible_hidden_exact_overlap"),
          "independent_linetype_validation": perf.get("linetype_validation"),
+         "independent_color_validation": perf.get("color_validation"),
          "nonfinite_points": perf.get("nonfinite_points"), "hard_failures": perf.get("hard_failures"),
          "geometry_export": geometry_export, "linetype_validation": linetype},
-        "改为解析 LINE/ARC/CIRCLE，合并连续物理边并显式设置线型比例，然后重新导出、审计。")
+        "保持投影几何不变，修正 HIDDEN/DIMENSION 图层颜色、实体随层属性、尺寸样式颜色或线型比例，然后重新导出、审计。")
 
     line_review = projection.get("readback_line_review") or {}
     preview_ok = (
@@ -591,7 +597,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v10",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v15",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,

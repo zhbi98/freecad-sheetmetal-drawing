@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary", required=True, type=Path)
     parser.add_argument("--vendor-path", type=Path)
     parser.add_argument("--runs", type=int, choices=(2, 3), default=3)
+    parser.add_argument("--hidden-color-aci", type=int, default=8)
+    parser.add_argument("--dimension-color-aci", type=int, default=2)
     return parser.parse_args()
 
 
@@ -54,6 +56,12 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    for name, value in (
+        ("hidden-color-aci", args.hidden_color_aci),
+        ("dimension-color-aci", args.dimension_color_aci),
+    ):
+        if not 1 <= value <= 255:
+            raise SystemExit(f"--{name} must be an ACI value from 1 to 255")
     required = (args.step, args.dxf, args.check, args.fit, args.preview)
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -69,6 +77,10 @@ def main() -> int:
         "check": sha256(args.check),
         "fit": sha256(args.fit),
         "preview": sha256(args.preview),
+    }
+    fixed_settings = {
+        "hidden_color_aci": args.hidden_color_aci,
+        "dimension_color_aci": args.dimension_color_aci,
     }
     runs = []
     previous_acceptance_time = None
@@ -103,7 +115,10 @@ def main() -> int:
         ], {0}))
         commands.append(run_command([*python,
             str(scripts / "dxf_performance_audit.py"), str(args.dxf.resolve()),
-            *common_vendor, "--json-out", str(performance_report.resolve()),
+            *common_vendor,
+            "--hidden-color-aci", str(args.hidden_color_aci),
+            "--dimension-color-aci", str(args.dimension_color_aci),
+            "--json-out", str(performance_report.resolve()),
         ], {0}))
         commands.append(run_command([*python,
             str(scripts / "project_acceptance.py"),
@@ -174,6 +189,7 @@ def main() -> int:
             "distinct_sequence": distinct_sequence,
             "inputs_unchanged": inputs_unchanged,
             "input_hashes": current_input_hashes,
+            "settings": fixed_settings,
             "hashes_pass": hashes_pass,
             "automatic_gate": acceptance_data.get("automatic_gate"),
             "pending_codes": (acceptance_data.get("closed_loop") or {}).get("pending_codes"),
@@ -183,7 +199,7 @@ def main() -> int:
 
     all_pass = len(runs) == args.runs and all(run["pass"] for run in runs)
     summary = {
-        "schema": "freecad-sheetmetal-drawing/closed-loop-recheck/v1",
+        "schema": "freecad-sheetmetal-drawing/closed-loop-recheck/v2",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "required_runs": args.runs,
         "completed_runs": len(runs),
@@ -192,6 +208,7 @@ def main() -> int:
         "dxf_path": str(args.dxf.resolve()),
         "dxf_sha256": dxf_hash,
         "fixed_input_hashes": fixed_input_hashes,
+        "fixed_settings": fixed_settings,
         "all_runs_same_source_and_dxf": all(
             run["source_sha256"] == source_hash and run["dxf_sha256"] == dxf_hash
             for run in runs

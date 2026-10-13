@@ -21,19 +21,20 @@
 
 项目/加工厂模板优先；未指定时使用下表。线宽是最终纸面线宽，颜色只用于屏幕分层，不代替线型和线宽。
 
-| 图层 | 线型 | 默认线宽 | 用途 |
-| --- | --- | ---: | --- |
-| `BORDER` | `CONTINUOUS` | `0.35 mm` | 图框 |
-| `VISIBLE` | `CONTINUOUS` | `0.25 mm` | 可见外轮廓、可见孔槽和折边 |
-| `HIDDEN` | `DASHED` | `0.13 mm` | 实际被遮挡且需要表达的内部轮廓 |
-| `CENTER` | `CENTER` | `0.13 mm` | 轴线、中心线和对称线 |
-| `DIMENSION` | `CONTINUOUS` | `0.18 mm` | 尺寸线、尺寸界线和引线 |
+| 图层 | 线型 | 默认线宽 | 默认屏幕颜色 | 用途 |
+| --- | --- | ---: | --- | --- |
+| `BORDER` | `CONTINUOUS` | `0.35 mm` | ACI 7 白/黑 | 图框 |
+| `VISIBLE` | `CONTINUOUS` | `0.25 mm` | ACI 7 白/黑 | 可见外轮廓、可见孔槽和折边 |
+| `HIDDEN` | `DASHED` | `0.13 mm` | ACI 8 灰色 | 实际被遮挡且需要表达的内部轮廓 |
+| `CENTER` | `CENTER` | `0.13 mm` | ACI 4 青色 | 轴线、中心线和对称线 |
+| `DIMENSION` | `CONTINUOUS` | `0.18 mm` | ACI 2 黄色 | 尺寸线、尺寸界线、箭头和尺寸文字 |
 
 1. 线宽层级必须满足 `BORDER ≥ VISIBLE > HIDDEN ≥ CENTER > 0`；尺寸线清晰但不得压过可见轮廓。模板另有规定时记录覆盖值，并在回读后验证。
 2. 线型必须在 DXF 线型表中真实定义。当前验证通过的 A1、比例 `2:3` 基准为：`$LTSCALE=1`，实体 `ltscale=1`，`DASHED=[4.0, 3.0, -1.0]`（3 mm 线段、1 mm 间隔），`CENTER=[8.0, 5.0, -1.0, 0.5, -1.5]`。其他比例以最终纸面约 `2～4 mm` 隐藏线段和 `0.6～1.5 mm` 间隔为目标反算模型空间图案，不直接照搬数值。
 3. 禁止使用 `0.3 mm 线段 + 0.3 mm 间隔` 一类在目标比例下呈点状的隐藏线。虚线过密、过疏、相位因碎实体反复重启或圆弧显示成点列均须返工。
 4. 完全重合的 `VISIBLE/HIDDEN` 实体必须删除隐藏副本；部分重合必须切分并删除重合隐藏区。每个视图先写 `HIDDEN`、后写 `VISIBLE`，且最终 DXF 的 `visible_hidden_exact_overlap` 必须为零。
 5. 直线、圆弧和整圆分别使用解析 `LINE/ARC/CIRCLE`。只有目标 DXF 不支持或解析恢复失败的曲线才允许离散，并须记录源边、误差和原因。
+6. 项目/加工厂模板未覆盖颜色时，`HIDDEN` 图层必须为 ACI 8，`DIMENSION` 图层必须为 ACI 2；不得只让图层名称不同而仍使用同一白色。两层的模型空间实体均使用 `BYLAYER`（ACI 256）且不得设置实体 True Color。每个 `DIMENSION` 必须位于 `DIMENSION` 图层；实际使用的 `DIMSTYLE` 和逐尺寸 `ACAD:DSTYLE` 局部覆盖中的 `DIMCLRD/DIMCLRE/DIMCLRT` 只能为 `BYBLOCK` 或 `BYLAYER`（ACI 0/256）。还须递归回读尺寸匿名块，以及从 `HIDDEN/DIMENSION` 图层引用的普通块；其中参与显示的图元只允许 `BYBLOCK/BYLAYER` 且不得有 True Color，禁止遗留写死 ACI 7 的尺寸线、界线、箭头或文字。已确认模板使用其他图层颜色时，通过性能审计和连续复核参数显式传入预期 ACI 值并保存覆盖依据；块内容和尺寸覆盖仍须继承图层，不得写死模板颜色。
 
 ## 3. 导出与回读
 
@@ -41,7 +42,7 @@
 2. 导出前核对单位、图层、字体、块、尺寸样式、六视图数量/位置/比例、图幅、第三角法标题栏和 `FREECAD_<front_source> → DRAWING_FRONT`；保存 HLR 原始/优化/待导出统计。
 3. 关闭源文档后，用可解析目标版本的 CAD 读取器重新打开最终 DXF。记录版本、单位、范围、图幅/打印比例、样式、块、实体类型/数量、折线顶点、文件大小和哈希；检查异常远点、丢失引用、字体替换和符号缺失。
 4. 先运行 `scripts/dxf_text_audit.py <最终.dxf> --check <工程图检查记录.json> --json-out <DXF文字审计.json>`。该脚本必须直接读取最终 DXF；工程图检查记录须提供每个 `TABLE/TITLEBLOCK` 文字 handle 对应的真实单元格边界，并在 `table_layout.titleblock_topology.merged_regions` 提供标题栏六个必需合并区。脚本独立重算字体解析、实际字形框、四向净距、格高比和线框相交，同时检查 `tolerance_title/drawing_name/unit/unit_value/projection_symbol/company_name` 内部没有 `TITLEBLOCK` 网格线。文字 handle 缺失/陈旧、合并区缺失、字体替换、字形框不可得、越格、压线、净距不足、格高比失败或合并区内部存在贯穿线，均不得继续交付。
-5. 运行 `scripts/dxf_performance_audit.py`。审计错误、审计修复、非有限坐标、同层精确重复投影和 `VISIBLE/HIDDEN` 精确重合必须均为零；图层线型及线宽层级必须通过，项目提供的实体、顶点、文件大小和回读耗时上限必须全部通过。
+5. 运行 `scripts/dxf_performance_audit.py`。审计错误、审计修复、非有限坐标、同层精确重复投影和 `VISIBLE/HIDDEN` 精确重合必须均为零；图层线型、线宽层级及 `color_validation` 必须通过。颜色审计必须覆盖图层、模型空间实体、逐尺寸局部覆盖、尺寸匿名块和从 `HIDDEN/DIMENSION` 引用的块内容；项目提供的实体、顶点、文件大小和回读耗时上限必须全部通过。无模板覆盖时使用默认 `--hidden-color-aci 8 --dimension-color-aci 2`；模板覆盖时只能传入已确认的对应 ACI 值，并把相同参数传给 `closed_loop_recheck.py`。
 6. 只从最终 DXF 生成高分辨率回读预览。无界面脚本须使用非交互后端，保存后关闭图形和 CAD 文档并正常退出；图片已生成但进程挂起仍判失败。
 7. 查看最终预览的整体图幅和关键局部后，运行 `scripts/record_projection_review.py --check <工程图检查记录.json> --preview <回读预览.png> --visible-contour-breaks <数量> --missing-internal-features <数量> --hidden-pattern-issues <数量> --reviewer <检查人>`。该步骤必须发生在预览生成后；脚本把结果与预览 SHA-256 绑定，禁止生成器在出 DXF 时预置通过。
 

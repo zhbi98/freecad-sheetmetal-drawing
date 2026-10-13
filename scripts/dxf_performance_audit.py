@@ -26,6 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-read-seconds", type=float)
     parser.add_argument("--raw-entities", type=int)
     parser.add_argument("--raw-vertices", type=int)
+    parser.add_argument("--hidden-color-aci", type=int, default=8,
+                        help="Expected HIDDEN layer ACI color; default 8 (gray).")
+    parser.add_argument("--dimension-color-aci", type=int, default=2,
+                        help="Expected DIMENSION layer ACI color; default 2 (yellow).")
     return parser.parse_args()
 
 
@@ -191,6 +195,13 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
         except Exception:
             return None
 
+    def layer_color(name: str) -> tuple[int | None, int | None]:
+        try:
+            layer = doc.layers.get(name)
+            return int(layer.dxf.color), layer.dxf.get("true_color")
+        except Exception:
+            return None, None
+
     border_lineweight = layer_lineweight("BORDER")
     visible_lineweight = layer_lineweight("VISIBLE")
     hidden_lineweight = layer_lineweight("HIDDEN")
@@ -213,6 +224,207 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
         and len(hidden_pattern) >= 2
         and lineweight_ok
     )
+    hidden_color, hidden_true_color = layer_color("HIDDEN")
+    dimension_color, dimension_true_color = layer_color("DIMENSION")
+
+    def aci_value(value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    color_entity_violation_count = 0
+    color_entity_violation_samples: list[dict[str, object]] = []
+    for entity in entities:
+        layer_name = str(entity.dxf.layer).upper()
+        if layer_name not in {"HIDDEN", "DIMENSION"}:
+            continue
+        aci = aci_value(entity.dxf.get("color", 256))
+        true_color = entity.dxf.get("true_color")
+        if aci != 256 or true_color is not None:
+            color_entity_violation_count += 1
+            if len(color_entity_violation_samples) < 100:
+                color_entity_violation_samples.append({
+                    "handle": str(entity.dxf.handle),
+                    "type": entity.dxftype(),
+                    "layer": layer_name,
+                    "aci": aci,
+                    "true_color": true_color,
+                })
+    dimension_entities = [
+        entity for entity in entities if entity.dxftype() == "DIMENSION"
+    ]
+    dimension_wrong_layer_samples: list[dict[str, object]] = []
+    dimension_effective_color_samples: list[dict[str, object]] = []
+    dimension_effective_color_violation_count = 0
+    used_dimstyles = sorted({str(entity.dxf.dimstyle) for entity in dimension_entities})
+    dimstyle_colors: dict[str, dict[str, int | None]] = {}
+    for name in used_dimstyles:
+        try:
+            style = doc.dimstyles.get(name)
+            dimstyle_colors[name] = {
+                key: aci_value(style.dxf.get(key, 0))
+                for key in ("dimclrd", "dimclre", "dimclrt")
+            }
+        except Exception:
+            dimstyle_colors[name] = {
+                "dimclrd": None, "dimclre": None, "dimclrt": None,
+            }
+    dimstyle_color_ok = all(
+        value in {0, 256}
+        for colors in dimstyle_colors.values() for value in colors.values()
+    )
+
+    block_color_violation_keys: set[tuple[str, str, str]] = set()
+    block_color_violation_samples: list[dict[str, object]] = []
+    missing_relevant_block_keys: set[tuple[str, str]] = set()
+    missing_relevant_block_samples: list[dict[str, object]] = []
+    audited_block_contexts: set[tuple[str, str | None]] = set()
+
+    def audit_block_colors(
+        block_name: str,
+        inherited_role: str | None,
+        path_names: tuple[str, ...],
+        active: frozenset[str],
+    ) -> None:
+        if not block_name or block_name in active:
+            return
+        context = (block_name, inherited_role)
+        if context in audited_block_contexts:
+            return
+        audited_block_contexts.add(context)
+        try:
+            block = doc.blocks.get(block_name)
+        except Exception:
+            if inherited_role is not None:
+                key = (inherited_role, block_name)
+                if key not in missing_relevant_block_keys:
+                    missing_relevant_block_keys.add(key)
+                    if len(missing_relevant_block_samples) < 100:
+                        missing_relevant_block_samples.append({
+                            "role": inherited_role,
+                            "block": block_name,
+                            "path": list(path_names),
+                        })
+            return
+        next_active = active | {block_name}
+        for child in block:
+            child_layer = str(child.dxf.get("layer", "0")).upper()
+            child_role = inherited_role
+            if child_layer in {"HIDDEN", "DIMENSION"}:
+                child_role = child_layer
+            if child_layer == "DEFPOINTS" and child.dxftype() == "POINT":
+                child_role = None
+            if child_role is not None:
+                aci = aci_value(child.dxf.get("color", 256))
+                true_color = child.dxf.get("true_color")
+                if aci not in {0, 256} or true_color is not None:
+                    handle = str(child.dxf.handle)
+                    key = (child_role, block_name, handle)
+                    if key not in block_color_violation_keys:
+                        block_color_violation_keys.add(key)
+                        if len(block_color_violation_samples) < 100:
+                            block_color_violation_samples.append({
+                                "role": child_role,
+                                "block": block_name,
+                                "handle": handle,
+                                "type": child.dxftype(),
+                                "layer": child_layer,
+                                "aci": aci,
+                                "true_color": true_color,
+                                "path": list(path_names),
+                            })
+            if child.dxftype() == "INSERT":
+                audit_block_colors(
+                    str(child.dxf.get("name", "")),
+                    child_role,
+                    (*path_names, block_name),
+                    next_active,
+                )
+
+    for insert in (entity for entity in entities if entity.dxftype() == "INSERT"):
+        layer_name = str(insert.dxf.layer).upper()
+        root_role = layer_name if layer_name in {"HIDDEN", "DIMENSION"} else None
+        audit_block_colors(
+            str(insert.dxf.get("name", "")),
+            root_role,
+            (f"MODELSPACE:{insert.dxf.handle}",),
+            frozenset(),
+        )
+
+    for dimension in dimension_entities:
+        handle = str(dimension.dxf.handle)
+        layer_name = str(dimension.dxf.layer).upper()
+        if layer_name != "DIMENSION" and len(dimension_wrong_layer_samples) < 100:
+            dimension_wrong_layer_samples.append({
+                "handle": handle,
+                "layer": layer_name,
+                "dimstyle": str(dimension.dxf.dimstyle),
+            })
+        try:
+            override = dimension.override()
+            effective_colors = {
+                key: aci_value(override.get(key, None))
+                for key in ("dimclrd", "dimclre", "dimclrt")
+            }
+            local_colors = {
+                key: aci_value(value)
+                for key, value in override.dimstyle_attribs.items()
+                if key in {"dimclrd", "dimclre", "dimclrt"}
+            }
+        except Exception:
+            effective_colors = {
+                "dimclrd": None, "dimclre": None, "dimclrt": None,
+            }
+            local_colors = {}
+        effective_ok = all(value in {0, 256} for value in effective_colors.values())
+        if not effective_ok:
+            dimension_effective_color_violation_count += 1
+        if len(dimension_effective_color_samples) < 100:
+            dimension_effective_color_samples.append({
+                "handle": handle,
+                "dimstyle": str(dimension.dxf.dimstyle),
+                "effective_colors": effective_colors,
+                "local_overrides": local_colors,
+                "pass": effective_ok,
+            })
+        geometry_block = str(dimension.dxf.get("geometry", ""))
+        if geometry_block:
+            audit_block_colors(
+                geometry_block,
+                "DIMENSION",
+                (f"DIMENSION:{handle}",),
+                frozenset(),
+            )
+        else:
+            key = ("DIMENSION", f"<missing:{handle}>")
+            missing_relevant_block_keys.add(key)
+            if len(missing_relevant_block_samples) < 100:
+                missing_relevant_block_samples.append({
+                    "role": "DIMENSION",
+                    "block": None,
+                    "dimension_handle": handle,
+                    "path": [f"DIMENSION:{handle}"],
+                })
+
+    dimension_wrong_layer_count = sum(
+        1 for entity in dimension_entities
+        if str(entity.dxf.layer).upper() != "DIMENSION"
+    )
+    block_color_violation_count = len(block_color_violation_keys)
+    missing_relevant_block_count = len(missing_relevant_block_keys)
+    color_ok = (
+        hidden_color == args.hidden_color_aci
+        and hidden_true_color is None
+        and dimension_color == args.dimension_color_aci
+        and dimension_true_color is None
+        and color_entity_violation_count == 0
+        and dimstyle_color_ok
+        and dimension_wrong_layer_count == 0
+        and dimension_effective_color_violation_count == 0
+        and block_color_violation_count == 0
+        and missing_relevant_block_count == 0
+    )
     hard_failures = []
     if audit.errors:
         hard_failures.append("DXF audit contains errors")
@@ -226,6 +438,10 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
         hard_failures.append("DXF contains coincident VISIBLE and HIDDEN geometry")
     if not linetype_ok:
         hard_failures.append("projection layer linetype or lineweight hierarchy is invalid")
+    if not color_ok:
+        hard_failures.append(
+            "HIDDEN/DIMENSION screen colors or BYLAYER inheritance are invalid"
+        )
     if args.max_entities is not None and len(entities) > args.max_entities:
         hard_failures.append("entity count exceeds the supplied limit")
     if (
@@ -266,6 +482,7 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
         }
 
     result = {
+        "schema": "freecad-sheetmetal-drawing/dxf-performance-audit/v2",
         "path": str(path.resolve()),
         "status": "fail" if hard_failures else "structural_pass_target_reader_pending",
         "hard_failures": hard_failures,
@@ -301,6 +518,40 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
             },
             "lineweight_hierarchy_pass": lineweight_ok,
         },
+        "color_validation": {
+            "pass": color_ok,
+            "expected_aci": {
+                "HIDDEN": args.hidden_color_aci,
+                "DIMENSION": args.dimension_color_aci,
+            },
+            "layers": {
+                "HIDDEN": {"aci": hidden_color, "true_color": hidden_true_color},
+                "DIMENSION": {
+                    "aci": dimension_color,
+                    "true_color": dimension_true_color,
+                },
+            },
+            "entity_policy": "BYLAYER_without_true_color",
+            "entity_violation_count": color_entity_violation_count,
+            "entity_violation_samples": color_entity_violation_samples,
+            "used_dimstyle_colors": dimstyle_colors,
+            "dimstyle_color_policy": "BYBLOCK_or_BYLAYER",
+            "dimstyle_color_pass": dimstyle_color_ok,
+            "dimension_entity_count": len(dimension_entities),
+            "dimension_wrong_layer_count": dimension_wrong_layer_count,
+            "dimension_wrong_layer_samples": dimension_wrong_layer_samples,
+            "dimension_effective_color_policy": "BYBLOCK_or_BYLAYER_after_local_overrides",
+            "dimension_effective_color_violation_count": (
+                dimension_effective_color_violation_count
+            ),
+            "dimension_effective_color_samples": dimension_effective_color_samples,
+            "block_content_color_policy": "BYBLOCK_or_BYLAYER_without_true_color",
+            "audited_block_context_count": len(audited_block_contexts),
+            "block_content_color_violation_count": block_color_violation_count,
+            "block_content_color_violation_samples": block_color_violation_samples,
+            "missing_relevant_block_count": missing_relevant_block_count,
+            "missing_relevant_block_samples": missing_relevant_block_samples,
+        },
         "nonfinite_points": nonfinite_points,
         "coordinate_bounds": [min_x, min_y, max_x, max_y],
         "raw_comparison": {
@@ -323,6 +574,12 @@ def audit_file(path: Path, ezdxf, args: argparse.Namespace) -> dict:
 
 def main() -> int:
     args = parse_args()
+    for name, value in (
+        ("hidden-color-aci", args.hidden_color_aci),
+        ("dimension-color-aci", args.dimension_color_aci),
+    ):
+        if not 1 <= value <= 255:
+            raise SystemExit(f"--{name} must be an ACI value from 1 to 255")
     path = args.dxf.resolve()
     if not path.is_file():
         raise SystemExit(f"DXF does not exist: {path}")
