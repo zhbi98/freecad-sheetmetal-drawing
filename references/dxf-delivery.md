@@ -12,7 +12,7 @@
 ## 2. 可编辑 CAD 结构
 
 1. 轮廓使用 `LINE/ARC/CIRCLE/LWPOLYLINE/POLYLINE/SPLINE` 等可编辑几何；尺寸优先 `DIMENSION`，引线优先 `LEADER/MLEADER`，文字使用 `TEXT/MTEXT`，重复且无遮挡差异的图形可用 `BLOCK/INSERT`。导出器不能保留关联尺寸时记录限制，并逐项复核显示值。
-2. 可见、隐藏、中心、尺寸、文字、压铆位号、说明、表格和图框/标题栏分层。至少保证 `VISIBLE/HIDDEN/CENTER/NOTES/TABLE/TITLEBLOCK` 可独立编辑、开关和打印；图层颜色、线型、线宽、线型比例和打印属性导出前后保持一致。
+2. 可见、隐藏、中心、尺寸、文字、压铆位号、说明、表格和图框/标题栏分层。至少保证 `VISIBLE/HIDDEN/CENTER/NOTES/TABLE/TITLEBLOCK` 可独立编辑、开关和打印；存在局部图、剖视或辅助视图时，还必须建立 `SUPPLEMENTARY_BOUNDARY/SUPPLEMENTARY_LABEL` 专用图层。图层颜色、线型、线宽、线型比例和打印属性导出前后保持一致。
 3. 使用任何非连续线型前先在 DXF 线型表中定义。显式写入并回读核对全局、纸空间/模型空间和实体线型比例；虚线图案按最终纸面毫米选择，必须在声明比例下表现为清楚的“线段＋间隔”，不得细密成点。回读发生线型替换、比例漂移或自动修复必须返工。
 4. 表格、标题栏和第三角法符号按[表格规范](notes-tables-titleblock.md)输出为可编辑线、圆弧、文字、块或目标版本可靠支持的表格/属性实体；不得栅格化。
 5. 中文字体、编码及 `⌀/R/±/°` 等符号必须在目标 CAD 和打印预览中完整显示；缺字、问号、乱码或未声明字体替换均不通过。
@@ -28,6 +28,8 @@
 | `HIDDEN` | `DASHED` | `0.13 mm` | ACI 8 灰色 | 实际被遮挡且需要表达的内部轮廓 |
 | `CENTER` | `CENTER` | `0.13 mm` | ACI 4 青色 | 轴线、中心线和对称线 |
 | `DIMENSION` | `CONTINUOUS` | `0.18 mm` | ACI 2 黄色 | 尺寸线、尺寸界线、箭头和尺寸文字 |
+| `SUPPLEMENTARY_BOUNDARY` | `DASHDOT` | `0.13 mm` | ACI 6 品红色 | 局部图来源边界或剖切范围；不计入零件几何 |
+| `SUPPLEMENTARY_LABEL` | `CONTINUOUS` | `0.18 mm` | ACI 6 品红色 | 来源/标题编号及观察或剖切方向箭头 |
 
 1. 线宽层级必须满足 `BORDER ≥ VISIBLE > HIDDEN ≥ CENTER > 0`；尺寸线清晰但不得压过可见轮廓。模板另有规定时记录覆盖值，并在回读后验证。
 2. 线型必须在 DXF 线型表中真实定义。当前验证通过的 A1、比例 `2:3` 基准为：`$LTSCALE=1`，实体 `ltscale=1`，`DASHED=[4.0, 3.0, -1.0]`（3 mm 线段、1 mm 间隔），`CENTER=[8.0, 5.0, -1.0, 0.5, -1.5]`。其他比例以最终纸面约 `2～4 mm` 隐藏线段和 `0.6～1.5 mm` 间隔为目标反算模型空间图案，不直接照搬数值。
@@ -35,6 +37,7 @@
 4. 完全重合的 `VISIBLE/HIDDEN` 实体必须删除隐藏副本；部分重合必须切分并删除重合隐藏区。每个视图先写 `HIDDEN`、后写 `VISIBLE`，且最终 DXF 的 `visible_hidden_exact_overlap` 必须为零。
 5. 直线、圆弧和整圆分别使用解析 `LINE/ARC/CIRCLE`。只有目标 DXF 不支持或解析恢复失败的曲线才允许离散，并须记录源边、误差和原因。
 6. 项目/加工厂模板未覆盖颜色时，`HIDDEN` 图层必须为 ACI 8，`DIMENSION` 图层必须为 ACI 2；不得只让图层名称不同而仍使用同一白色。两层的模型空间实体均使用 `BYLAYER`（ACI 256）且不得设置实体 True Color。每个 `DIMENSION` 必须位于 `DIMENSION` 图层；实际使用的 `DIMSTYLE` 和逐尺寸 `ACAD:DSTYLE` 局部覆盖中的 `DIMCLRD/DIMCLRE/DIMCLRT` 只能为 `BYBLOCK` 或 `BYLAYER`（ACI 0/256）。还须递归回读尺寸匿名块，以及从 `HIDDEN/DIMENSION` 图层引用的普通块；其中参与显示的图元只允许 `BYBLOCK/BYLAYER` 且不得有 True Color，禁止遗留写死 ACI 7 的尺寸线、界线、箭头或文字。已确认模板使用其他图层颜色时，通过性能审计和连续复核参数显式传入预期 ACI 值并保存覆盖依据；块内容和尺寸覆盖仍须继承图层，不得写死模板颜色。
+7. 存在补充视图时，`SUPPLEMENTARY_BOUNDARY` 与 `SUPPLEMENTARY_LABEL` 默认均为 ACI 6，且实体使用 `BYLAYER`、不得带 True Color；前者必须使用非连续细线，后者使用连续线。项目模板可以覆盖来源线型名称，不限于 `DASHDOT/DASHED/PHANTOM`，但该名称必须在最终 DXF 线型表中真实定义，编译图案中同时存在可见笔画/点和负值间隔；`CONTINUOUS/BYLAYER/BYBLOCK` 或未定义、没有间隔的图案均失败。模板覆盖后仍须保证两层与 `VISIBLE/HIDDEN/CENTER` 分层且异色，来源边界不得改成普通连续实线，也不得参与零件轮廓和 HLR 几何数量统计。
 
 ## 3. 导出与回读
 

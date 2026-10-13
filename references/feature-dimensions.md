@@ -20,9 +20,9 @@
 
 1. 默认策略为 `main_views_only_unless_traceable_and_necessary`：没有必要性证据时，`supplementary_view_validation` 必须记录 `declared_count=0`、`per_view=[]`、`pass=true`。不得因自动识别到孔组、压铆件、空白区域、标签拥挤或版面尚有空间而自动产生 `Kxx/Pxx/Sxx` 小图。
 2. 增加补充视图前，必须依次尝试主视图直接标注、调整标注落点、增大标准图幅和在可读范围内统一改变六视图比例。仅当仍存在“隐藏结构不能唯一标注、非真形特征必须给真形、内部结构必须剖开、已尝试布局后主视图仍无法无歧义表达”之一时才允许增加；原因分别记录为 `hidden_feature_not_unambiguously_dimensionable`、`non_true_shape_feature`、`internal_feature_requires_section` 或 `main_view_annotation_congestion_after_layout_attempts`。
-3. 每个补充视图在来源主视图上必须具有明确的来源边界或剖切线、观察/剖切箭头和编号；补充视图标题必须重复相同编号并给出比例。来源编号与标题编号是两个不同文字实体，缺一不可；仅在小图上写 `K01/P01` 不构成可追溯关系。
-4. 每项 `supplementary_view_validation.per_view` 至少记录：`id`、`kind`、`necessity_reason`、`source_feature_ids`、`source_main_view`、`source_transform_id`、`projection_transform_id`、`source_bounds_sheet_mm`、`view_bounds_sheet_mm`、`view_direction_3d`、`scale`、`source_label_handle`、`title_label_handle`、`source_boundary_handles`、`direction_arrow_handles`、`geometry_handles`、`dimension_handles` 和 `pass`。编号只使用 `Knn/Pnn/Snn`，全图唯一；范围、方向、比例、STEP 特征或任一实体 handle 缺失均失败。
-5. 最终 DXF 回读后，`feature_annotation_audit.py` 必须确认所有登记 handle 存在，来源标签与标题标签严格成对，登记标签集合与实际 `SUPPLEMENTARY_LABEL` 或 `Kxx/Pxx/Sxx` 标签集合完全一致。任何未登记、重复、过期或只有标题没有来源的标签均失败。补充视图不能替代六个主视图、不能移动压铆位号到非安装板外表面，也不能成为绕过主视图尺寸覆盖的手段。
+3. 每个补充视图在来源主视图上必须具有明确的来源边界或剖切线、观察/剖切箭头和编号；补充视图标题必须重复相同编号并给出比例。来源边界固定置于独立 `SUPPLEMENTARY_BOUNDARY` 图层，默认采用 ACI 6、`DASHDOT` 细点画线和 `0.13 mm` 纸面线宽；来源/标题编号和方向箭头置于独立 `SUPPLEMENTARY_LABEL` 图层，默认采用 ACI 6、`CONTINUOUS` 和 `0.18 mm`。两层实体均须 `BYLAYER` 且不得设置 True Color。项目模板可以整体覆盖颜色、线型名称和线宽；覆盖后的来源线型名称不受固定枚举限制，但必须在最终 DXF 线型表中真实定义，其编译图案须包含可见笔画/点和负值间隔，确保实际为非连续细线。来源边界还须与 `VISIBLE/HIDDEN/CENTER` 分层、异色，不得表现成普通零件轮廓。来源编号与标题编号是两个不同文字实体，缺一不可；仅在小图上写 `K01/P01` 不构成可追溯关系。
+4. 每项 `supplementary_view_validation.per_view` 至少记录：`id`、`kind`、`necessity_reason`、`source_feature_ids`、`source_main_view`、`source_transform_id`、`projection_transform_id`、`source_bounds_sheet_mm`、`view_bounds_sheet_mm`、`view_direction_3d`、`scale`、`source_label_handle`、`title_label_handle`、`source_boundary_handles`、`direction_arrow_handles`、`geometry_handles`、`dimension_handles` 和 `pass`。编号只使用 `Knn/Pnn/Snn`，全图唯一；范围、方向、比例、STEP 特征或任一实体 handle 缺失均失败。来源边界、方向箭头、两处编号、补充视图几何和尺寸的 handle 集合必须互不重叠；来源框与方向标识不得计入零件轮廓、孔槽、尺寸或 HLR 几何统计。
+5. 最终 DXF 回读后，`feature_annotation_audit.py` 必须确认所有登记 handle 存在，来源标签与标题标签严格成对，登记标签集合与实际 `SUPPLEMENTARY_LABEL` 或 `Kxx/Pxx/Sxx` 标签集合完全一致；同时检查两个专用图层的颜色、线型、线宽和实体随层属性，并拒绝专用图层上任何未登记的框线、箭头或文字。任何未登记、重复、过期、与零件几何共用 handle、只有标题没有来源，或表现为普通连续实线轮廓的来源框均失败。补充视图不能替代六个主视图、不能移动压铆位号到非安装板外表面，也不能成为绕过主视图尺寸覆盖的手段。
 
 ## 标注步骤与验收
 

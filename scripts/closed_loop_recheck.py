@@ -26,6 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, choices=(2, 3), default=3)
     parser.add_argument("--hidden-color-aci", type=int, default=8)
     parser.add_argument("--dimension-color-aci", type=int, default=2)
+    parser.add_argument("--supplementary-color-aci", type=int, default=6)
+    parser.add_argument("--supplementary-boundary-linetype", default="DASHDOT")
+    parser.add_argument("--supplementary-boundary-lineweight", type=int, default=13)
+    parser.add_argument("--supplementary-label-lineweight", type=int, default=18)
     return parser.parse_args()
 
 
@@ -59,6 +63,7 @@ def main() -> int:
     for name, value in (
         ("hidden-color-aci", args.hidden_color_aci),
         ("dimension-color-aci", args.dimension_color_aci),
+        ("supplementary-color-aci", args.supplementary_color_aci),
     ):
         if not 1 <= value <= 255:
             raise SystemExit(f"--{name} must be an ACI value from 1 to 255")
@@ -81,6 +86,10 @@ def main() -> int:
     fixed_settings = {
         "hidden_color_aci": args.hidden_color_aci,
         "dimension_color_aci": args.dimension_color_aci,
+        "supplementary_color_aci": args.supplementary_color_aci,
+        "supplementary_boundary_linetype": args.supplementary_boundary_linetype,
+        "supplementary_boundary_lineweight": args.supplementary_boundary_lineweight,
+        "supplementary_label_lineweight": args.supplementary_label_lineweight,
     }
     runs = []
     previous_acceptance_time = None
@@ -111,6 +120,10 @@ def main() -> int:
         commands.append(run_command([*python,
             str(scripts / "feature_annotation_audit.py"), str(args.dxf.resolve()),
             "--step", str(args.step.resolve()), "--check", str(args.check.resolve()),
+            "--supplementary-color-aci", str(args.supplementary_color_aci),
+            "--supplementary-boundary-linetype", args.supplementary_boundary_linetype,
+            "--supplementary-boundary-lineweight", str(args.supplementary_boundary_lineweight),
+            "--supplementary-label-lineweight", str(args.supplementary_label_lineweight),
             *common_vendor, "--json-out", str(feature_report.resolve()),
         ], {0}))
         commands.append(run_command([*python,

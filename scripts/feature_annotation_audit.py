@@ -24,6 +24,11 @@ SUPPLEMENTARY_REASONS = {
     "main_view_annotation_congestion_after_layout_attempts",
 }
 SUPPLEMENTARY_LABEL_RE = re.compile(r"^\s*(?:K|P|S)\d{2}(?!\d)", re.IGNORECASE)
+SUPPLEMENTARY_BOUNDARY_LAYER = "SUPPLEMENTARY_BOUNDARY"
+SUPPLEMENTARY_LABEL_LAYER = "SUPPLEMENTARY_LABEL"
+SUPPLEMENTARY_COLOR_ACI = 6
+SUPPLEMENTARY_BOUNDARY_LINEWEIGHT = 13
+SUPPLEMENTARY_LABEL_LINEWEIGHT = 18
 EXPECTED_VIEWS = {"FRONT", "REAR", "LEFT", "RIGHT", "TOP", "BOTTOM"}
 
 
@@ -34,6 +39,13 @@ def parse_args():
     parser.add_argument("--check", required=True, type=Path)
     parser.add_argument("--vendor-path", type=Path)
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--supplementary-color-aci", type=int,
+                        default=SUPPLEMENTARY_COLOR_ACI)
+    parser.add_argument("--supplementary-boundary-linetype", default="DASHDOT")
+    parser.add_argument("--supplementary-boundary-lineweight", type=int,
+                        default=SUPPLEMENTARY_BOUNDARY_LINEWEIGHT)
+    parser.add_argument("--supplementary-label-lineweight", type=int,
+                        default=SUPPLEMENTARY_LABEL_LINEWEIGHT)
     return parser.parse_args()
 
 
@@ -120,19 +132,85 @@ def handle_list(value):
     return [normalized_handle(item) for item in value if normalized_handle(item)]
 
 
-def audit_supplementary_views(document, record, main_view_transform_ids=None):
+def entity_layer(entity) -> str:
+    return str(entity.dxf.layer or "").strip().upper()
+
+
+def entity_uses_bylayer(entity) -> bool:
+    try:
+        has_true_color = entity.dxf.hasattr("true_color")
+    except (AttributeError, TypeError):
+        has_true_color = getattr(entity.dxf, "true_color", None) not in (None, 0)
+    return (
+        int(getattr(entity.dxf, "color", 256)) == 256
+        and str(getattr(entity.dxf, "linetype", "BYLAYER") or "BYLAYER").strip().upper()
+        == "BYLAYER"
+        and int(getattr(entity.dxf, "lineweight", -1)) == -1
+        and not has_true_color
+    )
+
+
+def layer_style(document, name: str):
+    try:
+        layer = document.layers.get(name)
+    except Exception:
+        return None
+    return {
+        "name": name,
+        "color_aci": int(layer.dxf.color),
+        "linetype": str(layer.dxf.linetype or "CONTINUOUS").strip().upper(),
+        "lineweight": int(layer.dxf.lineweight),
+    }
+
+
+def linetype_pattern(document, name: str):
+    """Return the compiled DXF pattern, or an empty list for an invalid reference."""
+    try:
+        values = document.linetypes.get(name).pattern_tags.compile()
+        return [float(value) for value in values]
+    except Exception:
+        return []
+
+
+def valid_noncontinuous_linetype(document, name: str) -> tuple[bool, list[float]]:
+    normalized = str(name or "").strip().upper()
+    pattern = linetype_pattern(document, normalized)
+    segments = pattern[1:] if len(pattern) >= 2 else []
+    valid = (
+        normalized not in {"", "CONTINUOUS", "BYLAYER", "BYBLOCK"}
+        and len(pattern) >= 2
+        and all(math.isfinite(value) for value in pattern)
+        and pattern[0] > 0.0
+        and any(value < 0.0 for value in segments)
+        and any(value >= 0.0 for value in segments)
+    )
+    return valid, pattern
+
+
+def audit_supplementary_views(
+        document, record, main_view_transform_ids=None, *, expected_color_aci=6,
+        expected_boundary_linetype="DASHDOT", expected_boundary_lineweight=13,
+        expected_label_lineweight=18):
     """Reject untraceable detail/section/auxiliary views in the final DXF."""
     main_view_transform_ids = main_view_transform_ids or {}
     entities = list(document.modelspace())
     by_handle = {normalized_handle(entity.dxf.handle): entity for entity in entities
                  if normalized_handle(entity.dxf.handle)}
+    boundary_layer_style = layer_style(document, SUPPLEMENTARY_BOUNDARY_LAYER)
+    label_layer_style = layer_style(document, SUPPLEMENTARY_LABEL_LAYER)
+    projection_layer_styles = [
+        layer_style(document, name) for name in ("VISIBLE", "HIDDEN", "CENTER")
+    ]
+    projection_color_acis = sorted({
+        style["color_aci"] for style in projection_layer_styles if style is not None
+    })
     actual_labels = []
     for entity in entities:
         if entity.dxftype() not in {"TEXT", "MTEXT", "ATTRIB"}:
             continue
         text = entity_text(entity).strip()
-        layer = str(entity.dxf.layer or "").strip().upper()
-        if layer == "SUPPLEMENTARY_LABEL" or SUPPLEMENTARY_LABEL_RE.match(text):
+        layer = entity_layer(entity)
+        if layer == SUPPLEMENTARY_LABEL_LAYER or SUPPLEMENTARY_LABEL_RE.match(text):
             actual_labels.append({
                 "handle": normalized_handle(entity.dxf.handle),
                 "layer": layer,
@@ -153,6 +231,8 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
     results = []
     identifiers = []
     declared_label_handles = []
+    declared_boundary_handles = []
+    declared_direction_arrow_handles = []
     for entry in per_view:
         entry = entry if isinstance(entry, dict) else {}
         identifier = str(entry.get("id") or "").strip().upper()
@@ -163,6 +243,8 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
         declared_label_handles.extend((source_label, title_label))
         source_boundary = handle_list(entry.get("source_boundary_handles"))
         direction_arrows = handle_list(entry.get("direction_arrow_handles"))
+        declared_boundary_handles.extend(source_boundary)
+        declared_direction_arrow_handles.extend(direction_arrows)
         geometry = handle_list(entry.get("geometry_handles"))
         dimensions = handle_list(entry.get("dimension_handles"))
         all_handles = ([source_label, title_label] + source_boundary
@@ -175,6 +257,18 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
                                 re.IGNORECASE) if identifier else None
         source_transform = str(entry.get("source_transform_id") or "").strip()
         expected_transform = str(main_view_transform_ids.get(source_view) or "").strip()
+        role_sets = [
+            {source_label}, {title_label}, set(source_boundary), set(direction_arrows),
+            set(geometry), set(dimensions),
+        ]
+        nonempty_role_handles = [handle for role in role_sets for handle in role if handle]
+        role_handles_are_disjoint = len(nonempty_role_handles) == len(set(nonempty_role_handles))
+        boundary_entities = [by_handle[handle] for handle in source_boundary
+                             if handle in by_handle]
+        arrow_entities = [by_handle[handle] for handle in direction_arrows
+                          if handle in by_handle]
+        label_entities = [by_handle[handle] for handle in (source_label, title_label)
+                          if handle in by_handle]
         checks = {
             "id": bool(identifier and SUPPLEMENTARY_LABEL_RE.fullmatch(identifier)),
             "kind": entry.get("kind") in SUPPLEMENTARY_KINDS,
@@ -192,6 +286,20 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
             "distinct_labels": bool(source_label and title_label and source_label != title_label),
             "source_boundary": bool(source_boundary),
             "direction_arrow": bool(direction_arrows),
+            "source_boundary_layer": bool(boundary_entities)
+                                     and all(entity_layer(entity)
+                                             == SUPPLEMENTARY_BOUNDARY_LAYER
+                                             for entity in boundary_entities),
+            "source_boundary_entity_style": bool(boundary_entities)
+                                            and all(entity_uses_bylayer(entity)
+                                                    for entity in boundary_entities),
+            "source_marker_layer": bool(arrow_entities and label_entities)
+                                  and all(entity_layer(entity) == SUPPLEMENTARY_LABEL_LAYER
+                                          for entity in arrow_entities + label_entities),
+            "source_marker_entity_style": bool(arrow_entities and label_entities)
+                                         and all(entity_uses_bylayer(entity)
+                                                 for entity in arrow_entities + label_entities),
+            "role_handles_are_disjoint": role_handles_are_disjoint,
             "geometry": bool(geometry),
             "dimension_handles_type": isinstance(entry.get("dimension_handles"), list),
             "handles_exist": not missing_handles and all(all_handles),
@@ -214,10 +322,63 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
     declared_handle_set = set(declared_label_handles)
     unregistered = sorted(actual_handle_set - declared_handle_set)
     missing_declared = sorted(declared_handle_set - actual_handle_set)
+    actual_boundary_handle_set = {
+        normalized_handle(entity.dxf.handle) for entity in entities
+        if entity_layer(entity) == SUPPLEMENTARY_BOUNDARY_LAYER
+        and normalized_handle(entity.dxf.handle)
+    }
+    declared_boundary_handle_set = set(declared_boundary_handles)
+    unregistered_boundaries = sorted(actual_boundary_handle_set - declared_boundary_handle_set)
+    actual_marker_handle_set = {
+        normalized_handle(entity.dxf.handle) for entity in entities
+        if entity_layer(entity) == SUPPLEMENTARY_LABEL_LAYER
+        and entity.dxftype() not in {"TEXT", "MTEXT", "ATTRIB"}
+        and normalized_handle(entity.dxf.handle)
+    }
+    declared_direction_arrow_handle_set = set(declared_direction_arrow_handles)
+    unregistered_direction_markers = sorted(
+        actual_marker_handle_set - declared_direction_arrow_handle_set)
+    style_required = bool(per_view)
+    expected_boundary_linetype = str(expected_boundary_linetype).strip().upper()
+    boundary_linetype_valid, boundary_linetype_pattern = valid_noncontinuous_linetype(
+        document, expected_boundary_linetype)
+    layer_style_validation = {
+        "required": style_required,
+        "expected": {
+            "color_aci": expected_color_aci,
+            "boundary_linetype": expected_boundary_linetype,
+            "boundary_lineweight": expected_boundary_lineweight,
+            "label_linetype": "CONTINUOUS",
+            "label_lineweight": expected_label_lineweight,
+        },
+        "projection_color_acis": projection_color_acis,
+        "boundary_linetype_defined_and_noncontinuous": boundary_linetype_valid,
+        "boundary_linetype_pattern": boundary_linetype_pattern,
+        "boundary": boundary_layer_style,
+        "label_and_direction": label_layer_style,
+        "pass": (
+            not style_required
+            or (
+                boundary_layer_style is not None
+                and boundary_linetype_valid
+                and boundary_layer_style["color_aci"] == expected_color_aci
+                and boundary_layer_style["color_aci"] not in projection_color_acis
+                and boundary_layer_style["linetype"] == expected_boundary_linetype
+                and boundary_layer_style["lineweight"] == expected_boundary_lineweight
+                and label_layer_style is not None
+                and label_layer_style["color_aci"] == expected_color_aci
+                and label_layer_style["color_aci"] not in projection_color_acis
+                and label_layer_style["linetype"] == "CONTINUOUS"
+                and label_layer_style["lineweight"] == expected_label_lineweight
+            )
+        ),
+    }
     passed = (
         top_level_ok
         and not duplicate_ids and not duplicate_label_handles
         and not unregistered and not missing_declared
+        and not unregistered_boundaries and not unregistered_direction_markers
+        and layer_style_validation["pass"]
         and len(actual_labels) == 2 * len(per_view)
         and all(item["pass"] for item in results)
     )
@@ -231,6 +392,9 @@ def audit_supplementary_views(document, record, main_view_transform_ids=None):
         "duplicate_declared_label_handles": duplicate_label_handles,
         "unregistered_actual_label_handles": unregistered,
         "missing_declared_label_handles": missing_declared,
+        "unregistered_source_boundary_handles": unregistered_boundaries,
+        "unregistered_direction_marker_handles": unregistered_direction_markers,
+        "layer_style_validation": layer_style_validation,
         "items": results,
         "pass": passed,
     }
@@ -287,6 +451,14 @@ def independent_groups(step: Path, App, Part, axis_view):
 
 def main() -> int:
     args = parse_args()
+    if not 1 <= args.supplementary_color_aci <= 255:
+        raise SystemExit("--supplementary-color-aci must be an ACI value from 1 to 255")
+    if args.supplementary_boundary_lineweight <= 0:
+        raise SystemExit("--supplementary-boundary-lineweight must be positive")
+    if args.supplementary_label_lineweight <= 0:
+        raise SystemExit("--supplementary-label-lineweight must be positive")
+    if not args.supplementary_boundary_linetype.strip():
+        raise SystemExit("--supplementary-boundary-linetype must not be empty")
     for path, label in ((args.step, "STEP"), (args.dxf, "DXF"), (args.check, "check")):
         if not path.is_file():
             raise SystemExit(f"{label} does not exist: {path}")
@@ -332,7 +504,11 @@ def main() -> int:
             "per_view_transforms") or {}).items()
     }
     supplementary = audit_supplementary_views(
-        document, check.get("supplementary_view_validation") or {}, transform_ids)
+        document, check.get("supplementary_view_validation") or {}, transform_ids,
+        expected_color_aci=args.supplementary_color_aci,
+        expected_boundary_linetype=args.supplementary_boundary_linetype,
+        expected_boundary_lineweight=args.supplementary_boundary_lineweight,
+        expected_label_lineweight=args.supplementary_label_lineweight)
     passed = (
         not audit.errors and not audit.fixes
         and check.get("source_sha256") == step_hash

@@ -426,6 +426,9 @@ def main() -> int:
         and not supplementary_audit.get("duplicate_declared_label_handles")
         and not supplementary_audit.get("unregistered_actual_label_handles")
         and not supplementary_audit.get("missing_declared_label_handles")
+        and not supplementary_audit.get("unregistered_source_boundary_handles")
+        and not supplementary_audit.get("unregistered_direction_marker_handles")
+        and (supplementary_audit.get("layer_style_validation") or {}).get("pass") is True
         and supplementary_audit.get("pass") is True
     )
     feature_audit_ok = (
@@ -462,7 +465,7 @@ def main() -> int:
          "independent_supplementary_view_audit": supplementary_audit,
          "independent_step_to_dxf_feature_audit": feature_audit,
          "violations": dimensions.get("violations"), "pass": dimensions.get("pass")},
-        "若仅漏标则补齐缺失的原生 DIMENSION/孔标并保留已有正确标注；删除无必要或无法双向追溯的局部图/剖视；确有必要时补齐主视图来源范围、观察/剖切方向、匹配编号、比例、STEP 特征和实体 handle，再重新导出。")
+        "若仅漏标则补齐缺失的原生 DIMENSION/孔标并保留已有正确标注；删除无必要或无法双向追溯的局部图/剖视；确有必要时补齐主视图来源范围、观察/剖切方向、匹配编号、比例、STEP 特征和实体 handle，并把来源边界置于 SUPPLEMENTARY_BOUNDARY 非连续细线层、编号与方向置于 SUPPLEMENTARY_LABEL 层，确保与零件几何 handle 互斥后重新导出。")
 
     table = check.get("table_layout") or {}
     edge_attachment = table.get("edge_attachment") or {}
