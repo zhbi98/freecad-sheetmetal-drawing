@@ -682,6 +682,7 @@ def main() -> int:
                 "recorded_view_bbox": record_box, "recorded_bbox_error_mm": box_error,
                 "scale_x": sx, "scale_y": sy, "scale": scale,
                 "pass": (math.isfinite(sx) and math.isfinite(sy) and abs(sx - sy) <= 0.002
+                         and abs(scale - 1.0) <= 0.002
                          and box_error is not None and box_error <= 0.25),
             }
 

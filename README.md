@@ -1,6 +1,6 @@
 # freecad-sheetmetal-drawing Skill
 
-使用 FreeCAD 将 STEP/STP 钣金总成生成同一图幅的六面正投影可编辑 DXF，并完成尺寸、压铆柱分类、图幅排版和交付验收。
+使用 FreeCAD 将 STEP/STP 钣金总成按 `1:1` 生成同一 A4～A0 或 A0 加长图幅的六面正投影可编辑 DXF，并完成尺寸、压铆柱分类、图幅排版和交付验收。
 
 制图规则和验收条件以 [SKILL.md](SKILL.md) 及其按阶段引用的 `references/` 为准；本 README 只简要说明工具链、安装和使用方法。
 
@@ -64,10 +64,10 @@ $freecad-sheetmetal-drawing
 源模型：<STEP/STP 文件>
 输出目录：<输出目录>
 前视图：<FRONT/REAR/LEFT/RIGHT/TOP/BOTTOM；未指定则使用默认 FRONT>
-图幅与比例：<指定值，或允许自动选择>
+图幅：<可选方向或已确认 A0 加长模板；视图固定 1:1，幅面自动选最小可行档>
 目标 CAD/DXF：<接收软件与版本；未知时写待验证>
 
-请生成同一图幅的六视图可编辑 DXF，完成尺寸和压铆柱分类标注，并执行回读、审计和验收。
+请按 1:1 生成同一图幅的六视图可编辑 DXF，从 A4～A0 选择最小可行标准图幅；A0 不足时使用最小 A0 加长档。文字、尺寸文字和表格须按最终图幅动态增大并重新排版。完成尺寸和压铆柱分类标注，并执行回读、审计和验收。
 ```
 
 ### 使用 Skill 绝对路径
@@ -103,7 +103,7 @@ $freecad-sheetmetal-drawing
 - [压铆柱工作流](references/stud-workflow.md)：实例识别、分面、规格分类、颜色和位号。
 - [投影与复杂度控制](references/projection-complexity.md)：HLR 分组、可见优先、去碎片和内部轮廓保持。
 - [特征尺寸清单](references/feature-dimensions.md)：六视图尺寸、孔槽、折边和定位标注要求。
-- [图幅与比例评估](references/sheet-fit-evaluation.md)：动态图幅及最高可行统一比例的计算和验收。
+- [1:1 图幅评估](references/sheet-fit-evaluation.md)：A4～A0 及 A0 加长图幅的选择和验收。
 - [表格与标题栏](references/notes-tables-titleblock.md)：技术要求、类别表、版本履历和联合标题栏。
 - [DXF 交付规则](references/dxf-delivery.md)：图层、线型、线宽、屏幕颜色、导出、回读和目标 CAD 验证。
 - [项目验收闭环](references/project-acceptance.md)：自动、人工、项目输入和工程批准门禁。

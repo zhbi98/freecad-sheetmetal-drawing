@@ -119,7 +119,8 @@ def valid_scale(value) -> bool:
     if not isinstance(value, str):
         return False
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*", value)
-    return bool(match and float(match.group(1)) > 0.0 and float(match.group(2)) > 0.0)
+    return bool(match and float(match.group(2)) > 0.0
+                and abs(float(match.group(1)) / float(match.group(2)) - 1.0) <= 1e-9)
 
 
 def normalized_handle(value) -> str:
@@ -175,14 +176,21 @@ def linetype_pattern(document, name: str):
 def valid_noncontinuous_linetype(document, name: str) -> tuple[bool, list[float]]:
     normalized = str(name or "").strip().upper()
     pattern = linetype_pattern(document, normalized)
-    segments = pattern[1:] if len(pattern) >= 2 else []
+    try:
+        raw_segments = [
+            float(tag.value)
+            for tag in document.linetypes.get(normalized).pattern_tags.tags
+            if tag.code == 49
+        ]
+    except Exception:
+        raw_segments = []
     valid = (
         normalized not in {"", "CONTINUOUS", "BYLAYER", "BYBLOCK"}
         and len(pattern) >= 2
         and all(math.isfinite(value) for value in pattern)
         and pattern[0] > 0.0
-        and any(value < 0.0 for value in segments)
-        and any(value >= 0.0 for value in segments)
+        and any(value < 0.0 for value in raw_segments)
+        and any(value >= 0.0 for value in raw_segments)
     )
     return valid, pattern
 

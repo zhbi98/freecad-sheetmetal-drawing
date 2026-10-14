@@ -7,9 +7,12 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from readability_scale import close_enough, readability_metrics
 
 
 EXPECTED_VIEWS = {"TOP", "BOTTOM", "FRONT", "REAR", "LEFT", "RIGHT"}
@@ -18,6 +21,13 @@ VALID_REVIEW = ("pass", "fail", "pending")
 HEIGHT_BASIS = "press_in_back_face_to_free_end_includes_local_sheet_thickness"
 HEIGHT_TOLERANCE_MM = 0.03
 SUPPLEMENTARY_POLICY = "main_views_only_unless_traceable_and_necessary"
+STANDARD_SHEET_SIZES = {
+    "A4": (210.0, 297.0),
+    "A3": (297.0, 420.0),
+    "A2": (420.0, 594.0),
+    "A1": (594.0, 841.0),
+    "A0": (841.0, 1189.0),
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -35,6 +45,157 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def one_to_one(value: Any) -> bool:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(float(value)) and abs(float(value) - 1.0) <= 1e-9
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*", value)
+        return bool(match and float(match.group(2)) > 0.0
+                    and abs(float(match.group(1)) / float(match.group(2)) - 1.0) <= 1e-9)
+    return False
+
+
+def sheet_selection_ok(selected: Any) -> bool:
+    if not isinstance(selected, dict) or selected.get("pass") is not True:
+        return False
+    orientation = selected.get("orientation")
+    size = selected.get("size_mm")
+    if not (
+        orientation in {"landscape", "portrait"}
+        and isinstance(size, list) and len(size) == 2
+        and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(float(value)) and float(value) > 0.0 for value in size)
+        and one_to_one(selected.get("scale"))
+        and one_to_one(selected.get("geometry_scale"))
+        and "previous_candidate_failure" in selected
+    ):
+        return False
+    sheet = selected.get("sheet")
+    sheet_class = selected.get("sheet_class")
+    previous = selected.get("previous_candidate_failure")
+    if sheet == "A4" and sheet_class == "standard":
+        previous_ok = previous is None
+    else:
+        if sheet_class == "standard" and sheet in STANDARD_SHEET_SIZES:
+            order = ["A4", "A3", "A2", "A1", "A0"]
+            expected_previous = order[order.index(sheet) - 1]
+        elif (sheet_class == "a0_extended"
+              and isinstance(selected.get("a0_extension_n"), int)
+              and not isinstance(selected.get("a0_extension_n"), bool)
+              and selected.get("a0_extension_n") >= 2):
+            extension = selected.get("a0_extension_n")
+            expected_previous = "A0" if extension == 2 else f"A0x{extension - 1}"
+        else:
+            return False
+        previous_ok = (
+            isinstance(previous, dict)
+            and previous.get("sheet") == expected_previous
+            and isinstance(previous.get("failed_constraints"), list)
+            and bool(previous.get("failed_constraints"))
+        )
+    if not previous_ok:
+        return False
+    expected_readability = readability_metrics(size)
+    if not (
+        selected.get("readability_basis") == expected_readability["basis"]
+        and close_enough(selected.get("readability_scale"), expected_readability["scale_factor"])
+        and close_enough(selected.get("body_text_min_mm"), expected_readability["body_text_min_mm"])
+        and close_enough(selected.get("major_text_min_mm"), expected_readability["major_text_min_mm"])
+        and close_enough(selected.get("dimension_text_min_mm"), expected_readability["dimension_text_min_mm"])
+        and close_enough(selected.get("dimension_arrow_min_mm"), expected_readability["dimension_arrow_min_mm"])
+        and close_enough(selected.get("dimension_text_gap_min_mm"), expected_readability["dimension_text_gap_min_mm"])
+    ):
+        return False
+    if sheet_class == "standard" and sheet in STANDARD_SHEET_SIZES:
+        short, long = STANDARD_SHEET_SIZES[sheet]
+        expected = (long, short) if orientation == "landscape" else (short, long)
+        return max(abs(float(actual) - target) for actual, target in zip(size, expected)) <= 0.05
+    if sheet_class == "a0_extended":
+        extension = selected.get("a0_extension_n")
+        if not isinstance(extension, int) or isinstance(extension, bool) or extension < 2:
+            return False
+        if sheet != f"A0x{extension}":
+            return False
+        long = 841.0 * extension
+        expected = (long, 1189.0) if orientation == "landscape" else (1189.0, long)
+        return max(abs(float(actual) - target) for actual, target in zip(size, expected)) <= 0.05
+    return False
+
+
+def sheet_iteration_stability_ok(fit: Any, selected: Any) -> bool:
+    if not isinstance(fit, dict) or not isinstance(selected, dict):
+        return False
+    history = fit.get("selection_iterations")
+    stability = fit.get("selection_stability")
+    if not (
+        isinstance(history, list)
+        and 2 <= len(history) <= 10
+        and isinstance(stability, dict)
+    ):
+        return False
+
+    signatures: list[tuple[str, str, str, float]] = []
+    for index, entry in enumerate(history, start=1):
+        if not isinstance(entry, dict) or entry.get("iteration") != index:
+            return False
+        size = entry.get("size_mm")
+        if not (
+            isinstance(size, list) and len(size) == 2
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value)) and float(value) > 0.0 for value in size)
+        ):
+            return False
+        expected = readability_metrics(size)
+        usable = entry.get("usable_size_mm")
+        w_all = entry.get("w_all_mm")
+        h_all = entry.get("h_all_mm")
+        if not (
+            entry.get("layout_recomputed") is True
+            and entry.get("candidate_fits") is True
+            and entry.get("orientation") in {"landscape", "portrait"}
+            and entry.get("sheet_class") in {"standard", "a0_extended"}
+            and bool(entry.get("sheet"))
+            and close_enough(entry.get("readability_scale"), expected["scale_factor"])
+            and isinstance(usable, list) and len(usable) == 2
+            and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value)) and float(value) > 0.0 for value in usable)
+            and isinstance(w_all, (int, float)) and not isinstance(w_all, bool)
+            and isinstance(h_all, (int, float)) and not isinstance(h_all, bool)
+            and math.isfinite(float(w_all)) and math.isfinite(float(h_all))
+            and float(usable[0]) <= float(size[0]) + 0.05
+            and float(usable[1]) <= float(size[1]) + 0.05
+            and 0.0 < float(w_all) <= float(usable[0]) + 0.05
+            and 0.0 < float(h_all) <= float(usable[1]) + 0.05
+        ):
+            return False
+        signatures.append((
+            str(entry.get("sheet")), str(entry.get("sheet_class")),
+            str(entry.get("orientation")), float(expected["scale_factor"]),
+        ))
+
+    stable_count = 1
+    for index in range(len(signatures) - 2, -1, -1):
+        left, right = signatures[index], signatures[index + 1]
+        if left[:3] != right[:3] or abs(left[3] - right[3]) > 1e-9:
+            break
+        stable_count += 1
+
+    selected_signature = (
+        str(selected.get("sheet")), str(selected.get("sheet_class")),
+        str(selected.get("orientation")), float(readability_metrics(selected.get("size_mm"))["scale_factor"]),
+    )
+    return bool(
+        signatures[-1][:3] == selected_signature[:3]
+        and abs(signatures[-1][3] - selected_signature[3]) <= 1e-9
+        and stability.get("max_iterations") == 10
+        and stability.get("required_consecutive_matches") == 2
+        and stability.get("completed_iterations") == len(history)
+        and stability.get("stable_consecutive_matches") == stable_count
+        and stable_count >= 2
+        and stability.get("stable") is True
+    )
+
+
 def calibrated_transform_ok(entry: Any, tolerance: float) -> bool:
     if not isinstance(entry, dict) or not entry.get("transform_id"):
         return False
@@ -48,6 +209,7 @@ def calibrated_transform_ok(entry: Any, tolerance: float) -> bool:
         and all(isinstance(row, list) and len(row) == 3 for row in matrix)
         and isinstance(offset, list) and len(offset) == 2
         and isinstance(points, list) and len(points) >= 3
+        and one_to_one(entry.get("scale"))
     ):
         return False
     projected = []
@@ -384,15 +546,36 @@ def main() -> int:
         "恢复固定第三角法布局和共同投影基准，完整读取全部 HLR 分组并补回缺失的内部功能轮廓后重新生成。")
 
     selected = fit.get("selected") or {}
-    fit_ok = selected.get("pass") is True and bool(selected.get("sheet")) and bool(selected.get("scale"))
-    add("A06", "图幅终评估", "automatic", "pass" if fit_ok else "fail",
-        {"sheet": selected.get("sheet"), "scale": selected.get("scale"),
-         "R_view": selected.get("R_view"), "pass": selected.get("pass")},
-        "重新计算完整实体外包络、图幅、比例、净距和碰撞。")
+    fit_iteration_audit = text_audit.get("fit_iteration_validation") or {}
+    fit_ok = (
+        sheet_selection_ok(selected)
+        and sheet_iteration_stability_ok(fit, selected)
+        and fit_iteration_audit.get("pass") is True
+        and fit_iteration_audit.get("final_iteration_extent_match") is True
+    )
+    add("A06", "1:1 图幅终评估", "automatic", "pass" if fit_ok else "fail",
+        {"sheet": selected.get("sheet"), "sheet_class": selected.get("sheet_class"),
+         "orientation": selected.get("orientation"), "size_mm": selected.get("size_mm"),
+         "a0_extension_n": selected.get("a0_extension_n"),
+         "scale": selected.get("scale"), "geometry_scale": selected.get("geometry_scale"),
+         "readability_basis": selected.get("readability_basis"),
+         "readability_scale": selected.get("readability_scale"),
+         "body_text_min_mm": selected.get("body_text_min_mm"),
+         "major_text_min_mm": selected.get("major_text_min_mm"),
+         "dimension_text_min_mm": selected.get("dimension_text_min_mm"),
+         "dimension_arrow_min_mm": selected.get("dimension_arrow_min_mm"),
+         "dimension_text_gap_min_mm": selected.get("dimension_text_gap_min_mm"),
+         "previous_candidate_failure": selected.get("previous_candidate_failure"),
+         "selection_iterations": fit.get("selection_iterations"),
+         "selection_stability": fit.get("selection_stability"),
+         "independent_final_dxf_fit_iteration_audit": fit_iteration_audit,
+         "pass": selected.get("pass")},
+        "保持全部视图为 1:1，按 A4 至 A0 重新选择最小可行标准图幅；A0 失败后选择最小 A0xN 加长档，并按最终图幅重算可读性系数、文字、表格、边界、净距和碰撞直至稳定。")
 
     dimensions = check.get("dimension_validation") or {}
     dimension_views = dimensions.get("per_view") or {}
     style_validation = dimensions.get("style_validation") or {}
+    dimension_style_audit = text_audit.get("dimension_style_validation") or {}
     expected_dimension_entities = style_validation.get("expected_dimension_entities")
     native_dimension_entities = style_validation.get("native_dimension_entities")
     native_style_ok = (
@@ -406,6 +589,11 @@ def main() -> int:
         and style_validation.get("closed_filled_arrows") is True
         and style_validation.get("extension_lines") is True
         and bool(style_validation.get("dimstyle_names"))
+        and dimension_style_audit.get("pass") is True
+        and dimension_style_audit.get("dimension_count") == native_dimension_entities
+        and dimension_style_audit.get("arrow_size_fail_count") == 0
+        and dimension_style_audit.get("text_gap_fail_count") == 0
+        and dimension_style_audit.get("arrow_shape_fail_count") == 0
     )
     feature_record = check.get("feature_annotation_validation") or {}
     supplementary_record = check.get("supplementary_view_validation") or {}
@@ -460,6 +648,7 @@ def main() -> int:
     add("A07", "六视图尺寸覆盖、补充视图追溯与模型回算", "automatic", "pass" if dimensions_ok else "fail",
         {"views": sorted(dimension_views), "per_view": dimension_views,
          "style_validation": style_validation,
+         "independent_dimension_style_audit": dimension_style_audit,
          "feature_annotation_validation": feature_record,
          "supplementary_view_validation": supplementary_record,
          "independent_supplementary_view_audit": supplementary_audit,
@@ -498,6 +687,14 @@ def main() -> int:
         and (text_audit.get("containment") or {}).get("line_intersection_count") == 0
         and (text_audit.get("containment") or {}).get("safety_clearance_fail_count") == 0
         and (text_audit.get("containment") or {}).get("height_ratio_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("pass") is True
+        and (text_audit.get("readability_validation") or {}).get("table_text_class_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("table_text_height_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("non_table_text_height_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("dimension_text_height_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("dimension_arrow_size_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("dimension_text_gap_fail_count") == 0
+        and (text_audit.get("readability_validation") or {}).get("dimension_arrow_shape_fail_count") == 0
     )
     add("A08", "表格文字与单元格", "automatic", "pass" if table_ok else "fail",
         {"checked_text_entities": checked_text_entities,
@@ -506,9 +703,10 @@ def main() -> int:
          "text_cell_containment": containment,
          "technical_requirements_validation": text_audit.get("technical_requirements_validation"),
          "unnoted_tolerance_validation": text_audit.get("unnoted_tolerance_validation"),
+         "readability_validation": text_audit.get("readability_validation"),
           "independent_final_dxf_text_audit": text_audit,
          "violations": table.get("violations")},
-        "恢复左下角固定技术要求全文，把表格重新锚定到图框边，恢复已确认模板或 Skill 默认未注公差值，并按最终字体字形包围框重算基线、字号、行高、列宽和合并网格，确保文字不压线或跨格。")
+        "恢复左下角固定技术要求全文，把表格重新锚定到图框边，恢复已确认模板或 Skill 默认未注公差值，并按最终图幅动态最低字高及最终字体字形包围框重算基线、字号、行高、列宽和合并网格，确保文字足够清晰且不压线或跨格。")
 
     readback = check.get("readback") or {}
     dxf_ok = (
@@ -624,7 +822,7 @@ def main() -> int:
         loop_action = "drawing_checks_complete"
 
     report = {
-        "schema": "freecad-sheetmetal-drawing/project-acceptance/v16",
+        "schema": "freecad-sheetmetal-drawing/project-acceptance/v19",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "project": {"source": check.get("source"), "dxf": str(dxf_path)},
         "automatic_gate": auto_status,

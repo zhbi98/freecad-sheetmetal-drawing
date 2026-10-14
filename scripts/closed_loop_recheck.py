@@ -109,7 +109,7 @@ def main() -> int:
         commands = []
         commands.append(run_command([*python,
             str(scripts / "dxf_text_audit.py"), str(args.dxf.resolve()),
-            "--check", str(args.check.resolve()), *common_vendor,
+            "--check", str(args.check.resolve()), "--fit", str(args.fit.resolve()), *common_vendor,
             "--json-out", str(text_report.resolve()),
         ], {0}))
         commands.append(run_command([*python,
